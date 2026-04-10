@@ -282,7 +282,7 @@ def main():
 
         if avg_val_dice > best_val_dice:
             best_val_dice = avg_val_dice
-            torch.save(model.state_dict(), "best_baseline_transunet.pth")
+            torch.save(model.state_dict(), "best_HiFormer.pth")
             print(f"🌟 [New Best Baseline Saved] Val Dice: {best_val_dice:.4f}")
 
         torch.cuda.empty_cache()
@@ -295,7 +295,7 @@ def main():
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 Baseline 最终性能...")
 
-    model.load_state_dict(torch.load("best_baseline_transunet.pth"))
+    model.load_state_dict(torch.load("best_HiFormer.pth"))
     model.eval()
     test_dices, test_ious = [], []
 
