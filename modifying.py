@@ -16,6 +16,79 @@ from tqdm import tqdm
 import pywt
 
 
+class LayerNorm2d(nn.Module):
+    """ConvNeXt 强烈推荐使用的 2D LayerNorm，比 BatchNorm 在小 BatchSize 下表现更好"""
+
+    def __init__(self, num_channels, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
+
+class WTConv2d(nn.Module):
+    """在小波域进行大核深度可分离卷积的核心算子"""
+
+    def __init__(self, in_channels, wt_type='db2'):
+        super().__init__()
+        wt_filter, iwt_filter = create_wavelet_filter(wt_type, in_channels, in_channels, torch.float)
+        self.wt_filter = nn.Parameter(wt_filter, requires_grad=True)
+        self.iwt_filter = nn.Parameter(iwt_filter, requires_grad=True)
+
+        # 在低频(LL)分支使用 5x5 的深度可分离卷积，等效于在原图上有 > 10x10 的超大感受野
+        self.wt_dwconv = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2, groups=in_channels, bias=False)
+
+    def forward(self, x):
+        curr_shape = x.shape
+        pads = (0, curr_shape[3] % 2, 0, curr_shape[2] % 2)
+        x_padded = F.pad(x, pads) if sum(pads) > 0 else x
+
+        wt_out = wavelet_transform(x_padded, self.wt_filter)
+        ll, hl, lh, hh = wt_out[:, :, 0], wt_out[:, :, 1], wt_out[:, :, 2], wt_out[:, :, 3]
+
+        # 仅对低频全局信息进行大核空间聚合
+        ll_conv = self.wt_dwconv(ll)
+
+        wt_out_modified = torch.stack([ll_conv, hl, lh, hh], dim=2)
+        out = inverse_wavelet_transform(wt_out_modified, self.iwt_filter)
+        return out[:, :, :curr_shape[2], :curr_shape[3]]
+
+
+class WTConvNeXtBlock(nn.Module):
+    """
+    完整的 WTConvNeXt Block
+    架构：WTConv(Depthwise) -> LayerNorm -> 1x1 Conv(扩维) -> GELU -> 1x1 Conv(降维) -> LayerScale -> 残差
+    """
+
+    def __init__(self, dim, wt_type='db2', drop_path=0.):
+        super().__init__()
+        self.dwconv = WTConv2d(dim, wt_type=wt_type)
+        self.norm = LayerNorm2d(dim, eps=1e-6)
+        # ConvNeXt 的倒置瓶颈设计 (Inverted Bottleneck)，中间维度扩大 4 倍
+        self.pwconv1 = nn.Conv2d(dim, 4 * dim, kernel_size=1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(4 * dim, dim, kernel_size=1)
+
+        # LayerScale 技巧：初始化为极小值，利于深层网络稳定训练
+        self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1) * 1e-6)
+
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = self.gamma * x
+        return input + x
+
 # ==========================================
 # 1. 小波变换基础算子 (优化版：引入反射填充避免边缘伪影)
 # ==========================================
@@ -192,7 +265,40 @@ class SpatialAttention(nn.Module):
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         return self.sigmoid(self.conv1(torch.cat([avg_out, max_out], dim=1)))
 
+class BottleneckSelfAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(BottleneckSelfAttention, self).__init__()
+        # 为了减少计算量，Query 和 Key 的通道数降维到 1/8
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
 
+        # 🌟 核心技巧：可学习的缩放参数 gamma
+        # 初始化为 0，意味着在训练初期，这个模块等同于什么都不做 (纯残差 x)
+        # 随着训练进行，网络会自己学习需要多少全局注意力，这样不会破坏预训练权重
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+
+        # 1. 计算 Query 和 Key [B, C//8, H*W]
+        proj_query = self.query_conv(x).view(b, -1, h * w).permute(0, 2, 1)  # [B, H*W, C//8]
+        proj_key = self.key_conv(x).view(b, -1, h * w)  # [B, C//8, H*W]
+
+        # 2. 计算注意力权重矩阵 [B, H*W, H*W]
+        # 除以 sqrt(d_k) 防止 softmax 梯度消失
+        energy = torch.bmm(proj_query, proj_key) / ((c // 8) ** 0.5)
+        attention = F.softmax(energy, dim=-1)
+
+        # 3. 将注意力施加到 Value 上 [B, C, H*W]
+        proj_value = self.value_conv(x).view(b, -1, h * w)
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))  # [B, C, H*W]
+
+        # 4. 恢复形状并加上残差
+        out = out.view(b, c, h, w)
+        out = self.gamma * out + x
+
+        return out
 class AttentionConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super(AttentionConvBlock, self).__init__()
@@ -213,7 +319,30 @@ class AttentionConvBlock(nn.Module):
         x = x * self.sa(x)
         return x
 
+class AttentionGate(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super(AttentionGate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
 
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
 # ==========================================
 # 4. 网络主体
 # ==========================================
@@ -227,9 +356,17 @@ class HANet_Final(nn.Module):
         self.encoder = densenet.features
         self.ch1, self.ch2, self.ch3, self.ch4 = 64, 256, 512, 1024
 
-        # 🌟 核心修改点 1：移除浅层(ch1)和深层(ch4)的 SFEB，仅保留中间两层
         self.sfeb2 = SFEB_Advanced(self.ch2, wt_type='db2')
         self.sfeb3 = SFEB_Advanced(self.ch3, wt_type='db2')
+
+        # === 🌟 改进：使用两个堆叠的 WTConvNeXt Block 替换传统的 Self-Attention ===
+        # 两个堆叠模块能提供深不可测的感受野，同时参数量远小于标准注意力
+        self.bottleneck_wtconvnext = nn.Sequential(
+            WTConvNeXtBlock(dim=1024, wt_type='db2'),
+            WTConvNeXtBlock(dim=1024, wt_type='db2')
+        )
+
+        self.ag1 = AttentionGate(F_g=128, F_l=self.ch1, F_int=64)
 
         self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.dec4 = AttentionConvBlock(1024 + self.ch4, 512)
@@ -246,7 +383,6 @@ class HANet_Final(nn.Module):
         self.up0 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.dec0 = AttentionConvBlock(64, 32)
 
-        # 在 HANet_Final 的 __init__ 中添加多个输出头
         self.out3 = nn.Conv2d(256, 1, kernel_size=1)
         self.out2 = nn.Conv2d(128, 1, kernel_size=1)
         self.out1 = nn.Conv2d(64, 1, kernel_size=1)
@@ -260,30 +396,39 @@ class HANet_Final(nn.Module):
         e4 = self.encoder.denseblock3(self.encoder.transition2(e3))
         b = self.encoder.norm5(self.encoder.denseblock4(self.encoder.transition3(e4)))
 
-        # 🌟 核心修改点 2：浅层(e0)和深层(e4)直接使用原生特征进行跳跃连接
-        skip1 = e0  # 浅层：保留最原始、最丰富的像素级细粒度纹理
-        skip2 = self.sfeb2(e2)  # 中层：使用 SFEB 提取边界和抑制散斑噪声
-        skip3 = self.sfeb3(e3)  # 中层：使用 SFEB 提取边界和抑制散斑噪声
-        skip4 = e4  # 深层：保留极低分辨率下最纯粹的全局语义特征
+        # === 🌟 改进：在这里通过 WTConvNeXt 提取全局上下文 ===
+        b = self.bottleneck_wtconvnext(b)
 
-        # 建议撤销 Attention Gate，保留你原本干净的 SFEB 跳跃链接
+        # 跳跃连接准备
+        skip1 = e0
+        skip2 = self.sfeb2(e2)
+        skip3 = self.sfeb3(e3)
+        skip4 = e4
+
+        # Decoder 融合
         d4 = self.dec4(torch.cat([self.up4(b), skip4], dim=1))
         d3 = self.dec3(torch.cat([self.up3(d4), skip3], dim=1))
         d2 = self.dec2(torch.cat([self.up2(d3), skip2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), skip1], dim=1))
 
-        # 主输出
+        up_d2 = self.up1(d2)
+        skip1_gated = self.ag1(g=up_d2, x=skip1)
+        d1 = self.dec1(torch.cat([up_d2, skip1_gated], dim=1))
+
         out = torch.sigmoid(self.final_conv(self.dec0(self.up0(d1))))
 
-        # 如果是在训练阶段，返回多尺度输出用于算 Loss
         if self.training:
             out1 = torch.sigmoid(self.out1(d1))
             out2 = torch.sigmoid(self.out2(d2))
             out3 = torch.sigmoid(self.out3(d3))
-            # out1, out2, out3 需要在计算 Loss 时用 F.interpolate 放大到原图大小
             return out, out1, out2, out3
         else:
             return out
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 
 # ==========================================
 # 5. 混合损失函数与 🌟增强版评估指标🌟
