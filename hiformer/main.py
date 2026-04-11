@@ -10,30 +10,32 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
-import matplotlib.pyplot as plt
 from tqdm import tqdm
-import gc
 
 
 # ==========================================
-# 1. 评估指标与损失函数 (5大核心指标)
+# 1. 评估指标与损失函数 (修改为标准的 BCE + Dice Loss)
 # ==========================================
-class HybridLoss(nn.Module):
-    def __init__(self, weight_bce=0.4, weight_jaccard=0.6):
-        super(HybridLoss, self).__init__()
+class BCEDiceLoss(nn.Module):
+    def __init__(self, weight_bce=0.4, weight_dice=0.6):
+        super(BCEDiceLoss, self).__init__()
         self.bce = nn.BCELoss()
         self.weight_bce = weight_bce
-        self.weight_jaccard = weight_jaccard
+        self.weight_dice = weight_dice
 
     def forward(self, pred, target):
+        # BCE Loss
         bce_loss = self.bce(pred, target)
+
+        # Dice Loss
         smooth = 1e-5
         pred_flat = pred.view(pred.size(0), -1)
         target_flat = target.view(target.size(0), -1)
         intersection = (pred_flat * target_flat).sum(dim=1)
-        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - intersection
-        jaccard_loss = 1.0 - (intersection + smooth) / (union + smooth)
-        return (self.weight_bce * bce_loss) + (self.weight_jaccard * jaccard_loss.mean())
+        dice_score = (2. * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
+        dice_loss = 1.0 - dice_score
+
+        return (self.weight_bce * bce_loss) + (self.weight_dice * dice_loss.mean())
 
 
 def calculate_metrics(pred, target, smooth=1e-5):
@@ -110,7 +112,8 @@ class HiFormer_Baseline(nn.Module):
 
         # 2. Transformer 分支
         self.patch_embed = nn.Conv2d(3, 512, 16, 16)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 256, 512))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, 256, 512))  # 适配 224x224 (224/16 = 14, 14*14=196 patches), 需要在 forward 中动态适配
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=512, nhead=8, dim_feedforward=2048, activation='gelu', batch_first=True),
             num_layers=4
@@ -139,7 +142,12 @@ class HiFormer_Baseline(nn.Module):
         e3 = self.cnn_layer3(e2)
 
         v_patch = self.patch_embed(x).flatten(2).transpose(1, 2)
-        v_trans = self.transformer(v_patch + self.pos_embed)
+
+        # 动态截取/适配位置编码以支持 224x224 (196 tokens)
+        seq_len = v_patch.shape[1]
+        pos_embed = self.pos_embed[:, :seq_len, :]
+
+        v_trans = self.transformer(v_patch + pos_embed)
         v_feat = v_trans.transpose(1, 2).reshape(B, -1, H // 16, W // 16)
 
         feat_dlf2 = self.dlf_2(e3, v_feat)
@@ -153,7 +161,7 @@ class HiFormer_Baseline(nn.Module):
 
 
 # ==========================================
-# 3. 数据集与加载器
+# 3. 数据集与加载器 (依照论文尺寸改为 224x224)
 # ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -163,12 +171,17 @@ class BUSIDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img = TF.resize(Image.open(self.image_paths[idx]).convert('RGB'), (256, 256))
-        mask = TF.resize(Image.open(self.mask_paths[idx]).convert('L'), (256, 256))
+        # 论文配置: 输入图像尺寸为 224x224
+        img = TF.resize(Image.open(self.image_paths[idx]).convert('RGB'), (224, 224))
+        mask = TF.resize(Image.open(self.mask_paths[idx]).convert('L'), (224, 224))
+
         if self.is_train:
+            # 论文提到的数据增强: flipping and rotating
             if random.random() > 0.5: img, mask = TF.hflip(img), TF.hflip(mask)
+            if random.random() > 0.5: img, mask = TF.vflip(img), TF.vflip(mask)  # 添加垂直翻转增加多样性
             angle = random.uniform(-15, 15)
             img, mask = TF.rotate(img, angle), TF.rotate(mask, angle)
+
         return TF.to_tensor(img), TF.to_tensor(mask)
 
 
@@ -191,15 +204,14 @@ def get_dataset_paths(data_dir):
 # ==========================================
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
-    MODE = "test"  # 改为 "test" 则跳过训练，直接加载权重进行测试
+    MODE = "test"  # "train" 或 "test"
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
-    save_path = "best_HiFormer.pth"  # 训练完保存的权重名，也是测试时读取的权重名
+    save_path = "best_HiFormer.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
 
-    # 1. 准备数据 (使用统一的 random seed 保证拆分出完全一样的 Test Set)
     all_imgs, all_masks = get_dataset_paths(data_dir)
     if len(all_imgs) == 0:
         print("❌ 未找到数据！请检查路径。")
@@ -219,12 +231,16 @@ def main():
     # 模式 A：训练模式
     # ==========================
     if MODE == "train":
-        train_loader = DataLoader(BUSIDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
+        # 论文配置: batch size 为 10
+        train_loader = DataLoader(BUSIDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=10, shuffle=True)
         val_loader = DataLoader(BUSIDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False),
-                                batch_size=8, shuffle=False)
+                                batch_size=10, shuffle=False)
 
-        criterion = HybridLoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+        criterion = BCEDiceLoss()
+
+        # 论文配置: SGD optimizer with a momentum of 0.9 and weight decay of 0.0001. Learning rate 0.01.
+        optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001)
+
         num_epochs = 30
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
@@ -265,75 +281,70 @@ def main():
     # ==========================
     # 模式 B：纯测试 / 评估模式
     # ==========================
-    print("\n" + "=" * 50)
-    print("🚀 开始在测试集上评估 HiFormer 最终性能...")
+    elif MODE == "test":
+        print("\n" + "=" * 50)
+        print("🚀 开始在测试集上评估 HiFormer 最终性能...")
 
-    # 仅加载测试集数据
-    test_loader = DataLoader(BUSIDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False), batch_size=8,
-                             shuffle=False)
+        # 测试集 batch_size 也可以根据需求调整，这里统一设为 10
+        test_loader = DataLoader(BUSIDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
+                                 batch_size=10,
+                                 shuffle=False)
 
-    # 加载已保存的权重
-    if not os.path.exists(save_path):
-        print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
-        return
+        if not os.path.exists(save_path):
+            print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
+            return
 
-    model.load_state_dict(torch.load(save_path, map_location=device))
-    model.eval()
+        model.load_state_dict(torch.load(save_path, map_location=device))
+        model.eval()
 
-    test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
-    # 🌟 GPU 预热 (Warm-up)
-    # 防止第一次启动推理时的寻址延迟拉低整体速度评估
-    print("🔥 正在进行 GPU 预热 (Warm-up)...")
-    dummy_input = torch.randn(1, 3, 256, 256).to(device)
-    with torch.no_grad():
-        for _ in range(10):
-            _ = model(dummy_input)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
 
-    # 初始化时间累加器
-    total_infer_time = 0.0
-    total_samples = 0
+        print("🔥 正在进行 GPU 预热 (Warm-up)...")
+        # 尺寸对齐 224x224
+        dummy_input = torch.randn(1, 3, 224, 224).to(device)
+        with torch.no_grad():
+            for _ in range(10):
+                _ = model(dummy_input)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-    with torch.no_grad():
-        for images, masks in tqdm(test_loader, desc="Testing"):
-            images, masks = images.to(device), masks.to(device)
+        total_infer_time = 0.0
+        total_samples = 0
 
-            # ---- 计时开始 ----
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            start_time = time.time()
+        with torch.no_grad():
+            for images, masks in tqdm(test_loader, desc="Testing"):
+                images, masks = images.to(device), masks.to(device)
 
-            outputs = model(images)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start_time = time.time()
 
-            # ---- 计时结束 ----
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            end_time = time.time()
+                outputs = model(images)
 
-            # 累加耗时和样本数
-            total_infer_time += (end_time - start_time)
-            total_samples += images.size(0)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                end_time = time.time()
 
-            # 记录精度指标
-            metrics = calculate_metrics(outputs, masks)
-            for k in test_res.keys():
-                test_res[k].extend(metrics[k])
+                total_infer_time += (end_time - start_time)
+                total_samples += images.size(0)
 
-    # 🌟 计算平均推理时间和 FPS
-    avg_time_per_image = (total_infer_time / total_samples) * 1000  # 转为毫秒 ms
-    fps = 1.0 / (total_infer_time / total_samples)  # 帧率 FPS
-    print("\n🏆 HiFormer 最终测试集成绩 🏆")
-    print(f"🔹 Dice (F1): {np.mean(test_res['dice']):.4f}")
-    print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
-    print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
-    print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
-    print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
-    print("-" * 50)
-    print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
-    print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
-    print(f"🚀 F P S    : {fps:.2f} frames / second")
-    print("=" * 50)
+                metrics = calculate_metrics(outputs, masks)
+                for k in test_res.keys():
+                    test_res[k].extend(metrics[k])
+
+        avg_time_per_image = (total_infer_time / total_samples) * 1000
+        fps = 1.0 / (total_infer_time / total_samples)
+        print("\n🏆 HiFormer 最终测试集成绩 🏆")
+        print(f"🔹 Dice (F1): {np.mean(test_res['dice']):.4f}")
+        print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
+        print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
+        print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
+        print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
+        print("-" * 50)
+        print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
+        print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
+        print(f"🚀 F P S    : {fps:.2f} frames / second")
+        print("=" * 50)
 
 
 if __name__ == "__main__":
