@@ -13,7 +13,6 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import gc
 import pywt
 
 
@@ -247,6 +246,10 @@ class HANet_Final(nn.Module):
         self.up0 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.dec0 = AttentionConvBlock(64, 32)
 
+        # 在 HANet_Final 的 __init__ 中添加多个输出头
+        self.out3 = nn.Conv2d(256, 1, kernel_size=1)
+        self.out2 = nn.Conv2d(128, 1, kernel_size=1)
+        self.out1 = nn.Conv2d(64, 1, kernel_size=1)
         self.final_conv = nn.Conv2d(32, 1, kernel_size=1)
 
     def forward(self, x):
@@ -263,14 +266,24 @@ class HANet_Final(nn.Module):
         skip3 = self.sfeb3(e3)  # 中层：使用 SFEB 提取边界和抑制散斑噪声
         skip4 = e4  # 深层：保留极低分辨率下最纯粹的全局语义特征
 
-        # Decoder
+        # 建议撤销 Attention Gate，保留你原本干净的 SFEB 跳跃链接
         d4 = self.dec4(torch.cat([self.up4(b), skip4], dim=1))
         d3 = self.dec3(torch.cat([self.up3(d4), skip3], dim=1))
         d2 = self.dec2(torch.cat([self.up2(d3), skip2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), skip1], dim=1))
 
+        # 主输出
         out = torch.sigmoid(self.final_conv(self.dec0(self.up0(d1))))
-        return out
+
+        # 如果是在训练阶段，返回多尺度输出用于算 Loss
+        if self.training:
+            out1 = torch.sigmoid(self.out1(d1))
+            out2 = torch.sigmoid(self.out2(d2))
+            out3 = torch.sigmoid(self.out3(d3))
+            # out1, out2, out3 需要在计算 Loss 时用 F.interpolate 放大到原图大小
+            return out, out1, out2, out3
+        else:
+            return out
 
 # ==========================================
 # 5. 混合损失函数与 🌟增强版评估指标🌟
@@ -424,7 +437,7 @@ def main():
 
         criterion = HybridLoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 25
+        num_epochs = 35
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -450,8 +463,32 @@ def main():
             for images, masks in pbar_train:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
+                # 新的代码
                 outputs = model(images)
-                loss = criterion(outputs, masks)
+
+                # 判断如果 outputs 是元组（说明在深度监督的训练阶段）
+                if isinstance(outputs, tuple):
+                    out, out1, out2, out3 = outputs
+
+                    # 1. 计算主输出的 Loss (权重最大)
+                    loss_main = criterion(out, masks)
+
+                    # 2. 将低分辨率的辅助输出上采样 (Upsample) 到真实标签 masks 的尺寸
+                    target_size = masks.shape[2:]  # 获取 (H, W)
+                    out1_up = F.interpolate(out1, size=target_size, mode='bilinear', align_corners=True)
+                    out2_up = F.interpolate(out2, size=target_size, mode='bilinear', align_corners=True)
+                    out3_up = F.interpolate(out3, size=target_size, mode='bilinear', align_corners=True)
+
+                    # 3. 计算辅助 Loss
+                    loss_aux1 = criterion(out1_up, masks)
+                    loss_aux2 = criterion(out2_up, masks)
+                    loss_aux3 = criterion(out3_up, masks)
+
+                    # 4. 加权求和 (通常主路给 1.0，辅助支路给 0.3 到 0.5)
+                    loss = loss_main + 0.4 * loss_aux1 + 0.4 * loss_aux2 + 0.4 * loss_aux3
+                else:
+                    # 验证(val)或测试(test)阶段，模型只返回一个输出
+                    loss = criterion(outputs, masks)
                 loss.backward()
                 optimizer.step()
 
@@ -492,8 +529,7 @@ def main():
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Model Saved] Val Dice: {best_val_dice:.4f}")
 
-            torch.cuda.empty_cache()
-            gc.collect()
+
 
         plt.ioff()
         plt.savefig('training_curve_HANet.png', dpi=150)
@@ -558,7 +594,7 @@ def main():
     avg_time_per_image = (total_infer_time / total_samples) * 1000  # 转为毫秒 ms
     fps = 1.0 / (total_infer_time / total_samples)  # 帧率 FPS
     print("\n🏆 mynet_Final 最终测试集成绩 🏆")
-    print(f"🔹 Dice (F1): {np.mean(test_res['dice']):.4f}")
+    print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
     print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
     print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
     print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")

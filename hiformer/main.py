@@ -11,6 +11,7 @@ from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
+import matplotlib.pyplot as plt  # 【新增】导入 matplotlib 用于绘图
 
 
 # ==========================================
@@ -113,7 +114,7 @@ class HiFormer_Baseline(nn.Module):
         # 2. Transformer 分支
         self.patch_embed = nn.Conv2d(3, 512, 16, 16)
         self.pos_embed = nn.Parameter(
-            torch.zeros(1, 256, 512))  # 适配 224x224 (224/16 = 14, 14*14=196 patches), 需要在 forward 中动态适配
+            torch.zeros(1, 256, 512))  # 适配 224x224
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=512, nhead=8, dim_feedforward=2048, activation='gelu', batch_first=True),
             num_layers=4
@@ -161,7 +162,7 @@ class HiFormer_Baseline(nn.Module):
 
 
 # ==========================================
-# 3. 数据集与加载器 (依照论文尺寸改为 224x224)
+# 3. 数据集与加载器
 # ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -171,14 +172,12 @@ class BUSIDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        # 论文配置: 输入图像尺寸为 224x224
         img = TF.resize(Image.open(self.image_paths[idx]).convert('RGB'), (224, 224))
         mask = TF.resize(Image.open(self.mask_paths[idx]).convert('L'), (224, 224))
 
         if self.is_train:
-            # 论文提到的数据增强: flipping and rotating
             if random.random() > 0.5: img, mask = TF.hflip(img), TF.hflip(mask)
-            if random.random() > 0.5: img, mask = TF.vflip(img), TF.vflip(mask)  # 添加垂直翻转增加多样性
+            if random.random() > 0.5: img, mask = TF.vflip(img), TF.vflip(mask)
             angle = random.uniform(-15, 15)
             img, mask = TF.rotate(img, angle), TF.rotate(mask, angle)
 
@@ -200,14 +199,15 @@ def get_dataset_paths(data_dir):
 
 
 # ==========================================
-# 4. 主控台：支持训练与一键纯测试
+# 4. 主控台
 # ==========================================
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
-    MODE = "test"  # "train" 或 "test"
+    MODE = "train"  # 改为 "train" 进行训练并生成图表
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     save_path = "best_HiFormer.pth"
+    plot_save_path = "training_curve.png"  # 【新增】图表保存路径
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
@@ -231,20 +231,21 @@ def main():
     # 模式 A：训练模式
     # ==========================
     if MODE == "train":
-        # 论文配置: batch size 为 10
         train_loader = DataLoader(BUSIDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=10, shuffle=True)
         val_loader = DataLoader(BUSIDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False),
                                 batch_size=10, shuffle=False)
 
         criterion = BCEDiceLoss()
-
-        # 论文配置: SGD optimizer with a momentum of 0.9 and weight decay of 0.0001. Learning rate 0.01.
         optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001)
 
-        num_epochs = 30
+        num_epochs = 45
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
+
+        # 【新增】用于记录每个 epoch 数据的列表
+        history_train_loss = []
+        history_val_dice = []
 
         for epoch in range(num_epochs):
             model.train()
@@ -267,16 +268,50 @@ def main():
                     metrics = calculate_metrics(model(images.to(device)), masks.to(device))
                     val_dices.extend(metrics["dice"])
 
+            # 计算当前的 Loss 和 Dice
+            avg_train_loss = train_loss_epoch / len(train_loader)
             avg_val_dice = np.mean(val_dices)
             scheduler.step()
 
-            print(
-                f"📉 Epoch {epoch + 1} | Loss: {train_loss_epoch / len(train_loader):.4f} | Val Dice: {avg_val_dice:.4f}")
+            # 【新增】将当前 epoch 的数据保存到记录列表中
+            history_train_loss.append(avg_train_loss)
+            history_val_dice.append(avg_val_dice)
+
+            print(f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f}")
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best HiFormer Saved] Val Dice: {best_val_dice:.4f}")
+
+        # 【新增】训练全部结束后，开始绘制训练图并保存
+        print("\n📊 开始生成并保存训练曲线图...")
+        plt.figure(figsize=(12, 5))
+
+        # 绘制 Loss 曲线
+        plt.subplot(1, 2, 1)
+        plt.plot(range(1, num_epochs + 1), history_train_loss, marker='o', label='Train Loss', color='b')
+        plt.title('Training Loss per Epoch')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.legend()
+
+        # 绘制 Dice 曲线
+        plt.subplot(1, 2, 2)
+        plt.plot(range(1, num_epochs + 1), history_val_dice, marker='s', label='Validation Dice', color='orange')
+        plt.title('Validation Dice Score per Epoch')
+        plt.xlabel('Epochs')
+        plt.ylabel('Dice Score')
+        plt.grid(True)
+        plt.legend()
+
+        # 调整布局并保存图片
+        plt.tight_layout()
+        plt.savefig(plot_save_path, dpi=300)
+        plt.close()
+        print(f"✅ 训练曲线已成功保存至当前目录: {plot_save_path}")
+
 
     # ==========================
     # 模式 B：纯测试 / 评估模式
@@ -285,7 +320,6 @@ def main():
         print("\n" + "=" * 50)
         print("🚀 开始在测试集上评估 HiFormer 最终性能...")
 
-        # 测试集 batch_size 也可以根据需求调整，这里统一设为 10
         test_loader = DataLoader(BUSIDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
                                  batch_size=10,
                                  shuffle=False)
@@ -300,7 +334,6 @@ def main():
         test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
 
         print("🔥 正在进行 GPU 预热 (Warm-up)...")
-        # 尺寸对齐 224x224
         dummy_input = torch.randn(1, 3, 224, 224).to(device)
         with torch.no_grad():
             for _ in range(10):
