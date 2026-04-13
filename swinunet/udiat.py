@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from modify2 import HybridLoss
-from modifying import calculate_metrics, HANet_MLP_Final
+from modifying import HANet_Final, calculate_metrics
+from swinunet.main import SwinUNet_Hybrid
 
 
 # ==========================================
@@ -108,7 +109,7 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = HANet_MLP_Final().to(device)
+    model = SwinUNet_Hybrid().to(device)
 
     if MODE == "train":
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
@@ -117,51 +118,82 @@ def main():
             shuffle=False)
 
         criterion = HybridLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)  # MLP 适合用 AdamW
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
         num_epochs = 40
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
+        history_loss, history_val_dice = [], []
+
         for epoch in range(num_epochs):
             model.train()
             train_loss_epoch = 0.0
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+            pbar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{num_epochs}]", leave=False)
+
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
+                outputs = model(images)
 
-                # 新的输出结构
-                out, out0, out2, out3 = model(images)
-                loss_main = criterion(out, masks)
-                loss_aux = (criterion(out0, masks) + criterion(out2, masks) + criterion(out3, masks)) / 3
-                loss = loss_main + 0.4 * loss_aux
+                # 深度监督 Loss 计算
+                if isinstance(outputs, tuple):
+                    out, out1, out2, out3 = outputs
+                    loss_main = criterion(out, masks)
+                    ts = masks.shape[2:]
+                    loss_aux = sum(
+                        criterion(F.interpolate(o, size=ts, mode='bilinear', align_corners=True), masks) for o in
+                        [out1, out2, out3])
+                    loss = loss_main + 0.4 * loss_aux
+                else:
+                    loss = criterion(outputs, masks)
 
                 loss.backward()
                 optimizer.step()
                 train_loss_epoch += loss.item()
                 pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
 
+            avg_train_loss = train_loss_epoch / len(train_loader)
+
+            # 验证评估
             model.eval()
             val_dices = []
             with torch.no_grad():
                 for images, masks in val_loader:
-                    images, masks = images.to(device), masks.to(device)
-                    outputs = model(images)
-                    val_dices.extend(calculate_metrics(outputs, masks)["dice"])
+                    out = model(images.to(device))
+                    # 防御性编程：万一 eval 模式下返回了 tuple，取主输出
+                    if isinstance(out, tuple): out = out[0]
+                    val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
             avg_val_dice = np.mean(val_dices)
             scheduler.step()
+            history_loss.append(avg_train_loss)
+            history_val_dice.append(avg_val_dice)
+
             print(
-                f"📉 Epoch {epoch + 1} | Loss: {train_loss_epoch / len(train_loader):.4f} | Val Dice: {avg_val_dice:.4f}")
+                f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
                 torch.save(model.state_dict(), save_path)
-                print(f"🌟 Saved Best Model: {best_val_dice:.4f}")
+                print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f}")
+
+        # 训练结束后静态绘制曲线图 (避免环境 GUI 兼容性报错)
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1);
+        plt.plot(history_loss, marker='o');
+        plt.title("Train Loss");
+        plt.grid()
+        plt.subplot(1, 2, 2);
+        plt.plot(history_val_dice, marker='s', color='orange');
+        plt.title("Val Dice");
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig('training_curve_HANet_UDIAT.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT.png")
+
 
     print("\n" + "=" * 50)
-    print("🚀 开始在完全未见的【测试集 (Test Set)】上评估最终性能...")
-
+    print("🚀 开始在完全未见的测试集上评估...")
     test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
                              batch_size=1, shuffle=False)
 
