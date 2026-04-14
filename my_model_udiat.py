@@ -54,8 +54,6 @@ class UDIATDataset(Dataset):
         image = TF.to_tensor(image)
         mask = TF.to_tensor(mask)
 
-        # 【关键修复】加上 ImageNet Normalization
-        image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         return image, mask
 
@@ -117,7 +115,7 @@ def main():
             shuffle=False)
 
         criterion = HybridLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)  # MLP 适合用 AdamW
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)  # MLP 适合用 AdamW
         num_epochs = 15
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
@@ -131,16 +129,16 @@ def main():
                 optimizer.zero_grad()
 
                 # 新的输出结构
-                out, out0, out2, out3, out4 = model(images)
+                out, out0, out2, out3,out4 = model(images)
                 loss_main = criterion(out, masks)
                 loss_aux = (
                         0.4 * criterion(out0, masks) +
                         0.4 * criterion(out2, masks) +
-                        0.4 * criterion(out3, masks) +
+                        0.4 * criterion(out3, masks)+
                         0.4 * criterion(out4, masks)
                 )
 
-                loss = loss_main + 0.4 * loss_aux
+                loss = loss_main + loss_aux * 0.4
 
                 loss.backward()
                 optimizer.step()

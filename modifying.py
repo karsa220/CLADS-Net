@@ -15,6 +15,56 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
+class CrossScaleMLPAttention(nn.Module):
+    def __init__(self, channels, num_scales=5, reduction=4):
+        super().__init__()
+        self.num_scales = num_scales
+        self.channels = channels
+
+        # 为了轻量化，中间维度进行缩放
+        mid_channels = max(1, (channels * num_scales) // reduction)
+
+        # 核心 MLP：学习跨尺度和跨通道的交互
+        self.mlp = nn.Sequential(
+            nn.Linear(channels * num_scales, mid_channels, bias=False),
+            nn.BatchNorm1d(mid_channels),
+            nn.GELU(),
+            nn.Linear(mid_channels, channels * num_scales, bias=False)
+        )
+
+    def forward(self, *features):
+        """
+        输入: 任意数量的 feature maps, 必须具有相同的维度 (B, C, H, W)
+        """
+        B, C, H, W = features[0].shape
+
+        # 1. 在维度 1 (Scale维度) 堆叠特征
+        # 形状: (B, K, C, H, W)
+        stacked_f = torch.stack(features, dim=1)
+
+        # 2. 空间维度压缩 (Global Average Pooling)
+        # 形状: (B, K, C)
+        squeezed = stacked_f.mean(dim=(3, 4))
+
+        # 3. MLP 跨尺度交互
+        # 展平送入 MLP: (B, K * C)
+        squeezed = squeezed.view(B, -1)
+        attn_weights = self.mlp(squeezed)
+
+        # 恢复形状: (B, K, C)
+        attn_weights = attn_weights.view(B, self.num_scales, C)
+
+        # 4. 在尺度维度(dim=1)进行 Softmax，使得各个尺度的权重之和为1
+        attn_weights = F.softmax(attn_weights, dim=1)
+
+        # 5. 加权求和融合
+        # 形状扩充以进行广播: (B, K, C, 1, 1)
+        attn_weights = attn_weights.view(B, self.num_scales, C, 1, 1)
+
+        # 逐元素相乘后，在尺度维度求和，输出形状: (B, C, H, W)
+        fused_out = (stacked_f * attn_weights).sum(dim=1)
+
+        return fused_out
 class MLP(nn.Module):
     def __init__(self, input_dim, embed_dim):
         super().__init__()
@@ -75,11 +125,11 @@ class HANet_MLP_Final(nn.Module):
         self.linear4 = MLP(self.ch4, embed_dim)
         self.linear_b = MLP(self.ch_b, embed_dim)
 
-        self.linear_fuse = nn.Sequential(
-            nn.Conv2d(embed_dim * 5, embed_dim, 1, bias=False),
-            nn.BatchNorm2d(embed_dim),
-            nn.LeakyReLU(0.01, inplace=True)
-        )
+        # --- 换成这个 ---
+        self.csma_fuse = CrossScaleMLPAttention(channels=embed_dim, num_scales=5, reduction=4)
+
+        # final_conv 保持不变，用于将 embed_dim 降维到 1 用于分割
+        self.final_conv = nn.Conv2d(embed_dim, 1, 1)
 
         self.final_conv = nn.Conv2d(embed_dim, 1, 1)
 
@@ -107,9 +157,13 @@ class HANet_MLP_Final(nn.Module):
         l4 = F.interpolate(self.linear4(s4), target_size, mode='bilinear', align_corners=False)
         lb = F.interpolate(self.linear_b(b), target_size, mode='bilinear', align_corners=False)
 
-        fused = self.linear_fuse(torch.cat([l0, l2, l3, l4, lb], dim=1))
+        # --- 换成这个 ---
+        # 将插值后的 5 个尺度的特征喂给 CSMA 模块
+        fused = self.csma_fuse(l0, l2, l3, l4, lb)
 
-        out = torch.sigmoid(F.interpolate(self.final_conv(fused), size=x.shape[2:], mode='bilinear', align_corners=False))
+        out = torch.sigmoid(
+            F.interpolate(self.final_conv(fused), size=x.shape[2:], mode='bilinear', align_corners=False))
+
 
         if self.training:
             out0 = torch.sigmoid(F.interpolate(self.aux0(l0), size=x.shape[2:], mode='bilinear', align_corners=False))
