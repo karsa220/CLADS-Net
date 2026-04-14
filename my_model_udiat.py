@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from modify2 import HybridLoss
-from modifying import calculate_metrics, HANet_MLP_Final
+from modifying import calculate_metrics, HANet_FPN_Final
 
 
 # ==========================================
@@ -108,7 +108,7 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = HANet_MLP_Final().to(device)
+    model = HANet_FPN_Final().to(device)
 
     if MODE == "train":
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
