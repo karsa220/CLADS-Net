@@ -1,3 +1,4 @@
+
 import os
 import random
 import time
@@ -10,16 +11,11 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
-# ==========================================
-# 1. 基础组件：MLP 与 特征增强
-# ==========================================
-
 class MLP(nn.Module):
-    """借鉴 SegFormer 的线性层，用于统一通道维度"""
-
     def __init__(self, input_dim, embed_dim):
         super().__init__()
         self.proj = nn.Linear(input_dim, embed_dim)
@@ -33,161 +29,95 @@ class MLP(nn.Module):
 
 
 class Basic_FEB_Leaky(nn.Module):
-    """带 LeakyReLU 的特征增强模块"""
-
     def __init__(self, in_channels):
-        super(Basic_FEB_Leaky, self).__init__()
+        super().__init__()
         self.local_conv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
-            nn.LeakyReLU(0.01, inplace=True)
+            nn.LeakyReLU(0.01, inplace=True),
         )
         self.gap = nn.AdaptiveAvgPool2d(1)
-        mid_channels = max(in_channels // 4, 1)
+        mid = max(in_channels // 4, 1)
         self.channel_att = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, 1),
+            nn.Conv2d(in_channels, mid, 1),
             nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv2d(mid_channels, in_channels, 1),
+            nn.Conv2d(mid, in_channels, 1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
         identity = x
         feat = self.local_conv(x)
-        att_weight = self.channel_att(self.gap(feat))
-        return feat * att_weight + identity
+        att = self.channel_att(self.gap(feat))
+        return feat * att + identity
 
 
-# ==========================================
-# 2. 上采样平滑模块 (方案一核心)
-# ==========================================
-
-class ProgressiveUpsample(nn.Module):
-    """
-    针对 16 倍极度放大的渐进式上采样模块 (8x8 -> 128x128)
-    分两步：插值到1/4尺寸 -> 卷积平滑 -> 插值到目标尺寸 -> 卷积平滑
-    """
-
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.smooth1 = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(embed_dim),
-            nn.ReLU(inplace=True)
-        )
-        self.smooth2 = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(embed_dim),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x, target_size):
-        mid_size = (target_size[0] // 4, target_size[1] // 4)
-        x = F.interpolate(x, size=mid_size, mode='bilinear', align_corners=False)
-        x = self.smooth1(x)
-
-        x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
-        x = self.smooth2(x)
-        return x
-
-
-class SingleUpsample(nn.Module):
-    """
-    针对 2 倍或 4 倍放大的普通平滑上采样模块
-    """
-
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.smooth = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(embed_dim),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x, target_size):
-        x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
-        return self.smooth(x)
-
-
-# ==========================================
-# 3. 网络主体：HANet 渐进式并行融合
-# ==========================================
-
-class HANet_Progressive_Final(nn.Module):
+class HANet_MLP_Final(nn.Module):
     def __init__(self, embed_dim=256):
-        super(HANet_Progressive_Final, self).__init__()
+        super().__init__()
+
         densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
         self.encoder = densenet.features
 
-        self.ch0, self.ch2, self.ch3, self.ch_b = 64, 256, 512, 1024
+        self.ch0, self.ch2, self.ch3 = 64, 256, 512
+        self.ch4, self.ch_b = 1024, 1024
 
         self.feb2 = Basic_FEB_Leaky(self.ch2)
         self.feb3 = Basic_FEB_Leaky(self.ch3)
+        self.feb4 = Basic_FEB_Leaky(self.ch4)
 
         self.linear0 = MLP(self.ch0, embed_dim)
         self.linear2 = MLP(self.ch2, embed_dim)
         self.linear3 = MLP(self.ch3, embed_dim)
+        self.linear4 = MLP(self.ch4, embed_dim)
         self.linear_b = MLP(self.ch_b, embed_dim)
 
-        # --- 核心引入：带平滑卷积的上采样模块 ---
-        self.up_2 = SingleUpsample(embed_dim)  # 64x64 -> 128x128
-        self.up_3 = SingleUpsample(embed_dim)  # 32x32 -> 128x128
-        self.up_b = ProgressiveUpsample(embed_dim)  # 8x8 -> 128x128 (两步法)
-
         self.linear_fuse = nn.Sequential(
-            nn.Conv2d(embed_dim * 4, embed_dim, kernel_size=1, bias=False),
+            nn.Conv2d(embed_dim * 5, embed_dim, 1, bias=False),
             nn.BatchNorm2d(embed_dim),
             nn.LeakyReLU(0.01, inplace=True)
         )
 
-        self.final_conv = nn.Conv2d(embed_dim, 1, kernel_size=1)
+        self.final_conv = nn.Conv2d(embed_dim, 1, 1)
 
-        # 辅助输出头
-        self.aux0 = nn.Conv2d(embed_dim, 1, kernel_size=1)
-        self.aux2 = nn.Conv2d(embed_dim, 1, kernel_size=1)
-        self.aux3 = nn.Conv2d(embed_dim, 1, kernel_size=1)
+        self.aux0 = nn.Conv2d(embed_dim, 1, 1)
+        self.aux2 = nn.Conv2d(embed_dim, 1, 1)
+        self.aux3 = nn.Conv2d(embed_dim, 1, 1)
+        self.aux4 = nn.Conv2d(embed_dim, 1, 1)
 
     def forward(self, x):
-        e0 = self.encoder.relu0(self.encoder.norm0(self.encoder.conv0(x)))  # [B, 64, 128, 128]
-        e2 = self.encoder.denseblock1(self.encoder.pool0(e0))  # [B, 256, 64, 64]
-        e3 = self.encoder.denseblock2(self.encoder.transition1(e2))  # [B, 512, 32, 32]
-
-        e4 = self.encoder.denseblock3(self.encoder.transition2(e3))  # [B, 1024, 16, 16]
-        b = self.encoder.norm5(self.encoder.denseblock4(self.encoder.transition3(e4)))  # [B, 1024, 8, 8]
+        e0 = self.encoder.relu0(self.encoder.norm0(self.encoder.conv0(x)))
+        e2 = self.encoder.denseblock1(self.encoder.pool0(e0))
+        e3 = self.encoder.denseblock2(self.encoder.transition1(e2))
+        e4 = self.encoder.denseblock3(self.encoder.transition2(e3))
+        b = self.encoder.norm5(self.encoder.denseblock4(self.encoder.transition3(e4)))
 
         s2 = self.feb2(e2)
         s3 = self.feb3(e3)
+        s4 = self.feb4(e4)
 
-        target_size = e0.size()[2:]  # 128x128
+        target_size = e0.shape[2:]
 
-        # --- 使用平滑上采样替代直接插值 ---
-        _l0 = self.linear0(e0)  # 原尺寸
-        _l2 = self.up_2(self.linear2(s2), target_size)  # 平滑上采样 2 倍
-        _l3 = self.up_3(self.linear3(s3), target_size)  # 平滑上采样 4 倍
-        _lb = self.up_b(self.linear_b(b), target_size)  # 渐进平滑上采样 16 倍
+        l0 = self.linear0(e0)
+        l2 = F.interpolate(self.linear2(s2), target_size, mode='bilinear', align_corners=False)
+        l3 = F.interpolate(self.linear3(s3), target_size, mode='bilinear', align_corners=False)
+        l4 = F.interpolate(self.linear4(s4), target_size, mode='bilinear', align_corners=False)
+        lb = F.interpolate(self.linear_b(b), target_size, mode='bilinear', align_corners=False)
 
-        # 并行拼接融合
-        fused = self.linear_fuse(torch.cat([_l0, _l2, _l3, _lb], dim=1))
+        fused = self.linear_fuse(torch.cat([l0, l2, l3, l4, lb], dim=1))
 
-        out = torch.sigmoid(
-            F.interpolate(self.final_conv(fused), size=x.size()[2:], mode='bilinear', align_corners=False))
+        out = torch.sigmoid(F.interpolate(self.final_conv(fused), size=x.shape[2:], mode='bilinear', align_corners=False))
 
         if self.training:
-            out0 = torch.sigmoid(F.interpolate(self.aux0(_l0), size=x.size()[2:], mode='bilinear', align_corners=False))
-            out2 = torch.sigmoid(F.interpolate(self.aux2(_l2), size=x.size()[2:], mode='bilinear', align_corners=False))
-            out3 = torch.sigmoid(F.interpolate(self.aux3(_lb), size=x.size()[2:], mode='bilinear', align_corners=False))
-            return out, out0, out2, out3
-        else:
-            return out
-
-
-# ==========================================
-# 4. 损失函数与评价指标
-# ==========================================
-
+            out0 = torch.sigmoid(F.interpolate(self.aux0(l0), size=x.shape[2:], mode='bilinear', align_corners=False))
+            out2 = torch.sigmoid(F.interpolate(self.aux2(l2), size=x.shape[2:], mode='bilinear', align_corners=False))
+            out3 = torch.sigmoid(F.interpolate(self.aux3(lb), size=x.shape[2:], mode='bilinear', align_corners=False))
+            out4 = torch.sigmoid(F.interpolate(self.aux4(l4), size=x.shape[2:], mode='bilinear', align_corners=False))
+            return out, out0, out2, out3, out4
+        return out
 class HybridLoss(nn.Module):
     def __init__(self, weight_bce=0.4, weight_dice=0.6):
         super(HybridLoss, self).__init__()
@@ -206,14 +136,15 @@ class HybridLoss(nn.Module):
         return (self.weight_bce * bce_loss) + (self.weight_dice * dice_loss.mean())
 
 
-def calculate_metrics(pred_bin, target, smooth=1e-5):
+def calculate_metrics(pred, target, smooth=1e-5):
+    pred_bin = (pred > 0.5).float()
+    target_bin = target.float()
     pred_flat = pred_bin.view(pred_bin.size(0), -1)
-    target_flat = target.view(target.size(0), -1)
+    target_flat = target_bin.view(target_bin.size(0), -1)
     tp = (pred_flat * target_flat).sum(dim=1)
     fp = (pred_flat * (1 - target_flat)).sum(dim=1)
     fn = ((1 - pred_flat) * target_flat).sum(dim=1)
     tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
-
     dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
     iou = (tp + smooth) / (tp + fp + fn + smooth)
     acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
@@ -223,7 +154,7 @@ def calculate_metrics(pred_bin, target, smooth=1e-5):
 
 
 # ==========================================
-# 5. 数据加载与主流程
+# 4. 数据加载与主流程 (已适配新模型)
 # ==========================================
 
 class BUSIDataset(Dataset):
@@ -267,12 +198,12 @@ def get_dataset_paths(data_dir):
 
 
 def main():
-    MODE = "train"  # 改为 "test" 测试最终性能
-    save_path = "best_model_progressive_decoder.pth"
-    data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
+    MODE = "train"
+    save_path = "best_model_mlp_decoder.pth"
+    data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"  # 请根据实际修改
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Using device: {device} | 📐 Architecture: HANet-Progressive (Scheme 1)")
+    print(f"🚀 Using device: {device} | 📐 Architecture: HANet-MLP")
 
     all_imgs, all_masks = get_dataset_paths(data_dir)
     total_size = len(all_imgs)
@@ -286,8 +217,8 @@ def main():
     train_size = int(0.8 * total_size)
     val_size = int(0.1 * total_size)
 
-    # 实例化模型
-    model = HANet_Progressive_Final(embed_dim=256).to(device)
+    # 实例化新模型
+    model = HANet_MLP_Final(embed_dim=256).to(device)
 
     if MODE == "train":
         train_loader = DataLoader(BUSIDataset(all_imgs[:train_size], all_masks[:train_size], True), batch_size=8,
@@ -297,40 +228,35 @@ def main():
             batch_size=8)
 
         criterion = HybridLoss()
-
-        # 差异化学习率
-        encoder_params = list(map(id, model.encoder.parameters()))
-        base_params = filter(lambda p: id(p) not in encoder_params, model.parameters())
-        optimizer = optim.AdamW([
-            {'params': model.encoder.parameters(), 'lr': 1e-4},
-            {'params': base_params, 'lr': 1e-3}
-        ], weight_decay=1e-4)
-
-        num_epochs = 50
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)  # MLP 适合用 AdamW
+        num_epochs = 15
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
         for epoch in range(num_epochs):
             model.train()
             train_loss_epoch = 0.0
-
-            # 动态衰减深层监督权重
-            aux_weight = max(0.1, 0.4 * (1 - epoch / num_epochs))
-
             pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
 
-                out, out0, out2, out3 = model(images)
+                # 新的输出结构
+                out, out0, out2, out3,out4 = model(images)
                 loss_main = criterion(out, masks)
-                loss_aux = (criterion(out0, masks) + criterion(out2, masks) + criterion(out3, masks)) / 3.0
-                loss = loss_main + aux_weight * loss_aux
+                loss_aux = (
+                        0.4 * criterion(out0, masks) +
+                        0.4 * criterion(out2, masks) +
+                        0.4 * criterion(out3, masks) +
+                        0.4 * criterion(out4, masks)
+                )
+
+                loss = loss_main + 0.4 * loss_aux
 
                 loss.backward()
                 optimizer.step()
                 train_loss_epoch += loss.item()
-                pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'AuxWt': f"{aux_weight:.2f}"})
+                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
 
             model.eval()
             val_dices = []
@@ -338,8 +264,7 @@ def main():
                 for images, masks in val_loader:
                     images, masks = images.to(device), masks.to(device)
                     outputs = model(images)
-                    pred_bin = (outputs > 0.5).float()
-                    val_dices.extend(calculate_metrics(pred_bin, masks)["dice"])
+                    val_dices.extend(calculate_metrics(outputs, masks)["dice"])
 
             avg_val_dice = np.mean(val_dices)
             scheduler.step()
@@ -365,27 +290,51 @@ def main():
     model.eval()
 
     test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
+    print("🔥 正在进行 GPU 预热 (Warm-up)...")
+    dummy_input = torch.randn(1, 3, 256, 256).to(device)
+    with torch.no_grad():
+        for _ in range(10):
+            _ = model(dummy_input)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    total_infer_time = 0.0
+    total_samples = 0
 
     with torch.no_grad():
         for images, masks in tqdm(test_loader, desc="Testing"):
             images, masks = images.to(device), masks.to(device)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.time()
+
             outputs = model(images)
 
-            # 直接通过阈值二值化（去除了 cv2 连通域后处理）
-            pred_bin = (outputs > 0.5).float()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = time.time()
 
-            metrics = calculate_metrics(pred_bin, masks)
+            total_infer_time += (end_time - start_time)
+            total_samples += images.size(0)
+
+            metrics = calculate_metrics(outputs, masks)
             for k in test_res.keys():
                 test_res[k].extend(metrics[k])
 
-    print("\n🏆 Progressive_Baseline 最终测试集成绩 🏆")
+    avg_time_per_image = (total_infer_time / total_samples) * 1000
+    fps = 1.0 / (total_infer_time / total_samples)
+    print("\n🏆 mynet_Baseline  最终测试集成绩 🏆")
     print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
     print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
     print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
     print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
     print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
+    print("-" * 50)
+    print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
+    print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
+    print(f"🚀 F P S    : {fps:.2f} frames / second")
     print("=" * 50)
-
 
 if __name__ == "__main__":
     main()

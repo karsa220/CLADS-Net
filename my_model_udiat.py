@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from modify2 import HybridLoss
-from modifying import calculate_metrics, HANet_FPN_Final
+from modifying import calculate_metrics, HANet_MLP_Final
 
 
 # ==========================================
@@ -108,7 +108,7 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = HANet_FPN_Final().to(device)
+    model = HANet_MLP_Final().to(device)
 
     if MODE == "train":
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
@@ -118,7 +118,7 @@ def main():
 
         criterion = HybridLoss()
         optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)  # MLP 适合用 AdamW
-        num_epochs = 40
+        num_epochs = 15
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -131,9 +131,15 @@ def main():
                 optimizer.zero_grad()
 
                 # 新的输出结构
-                out, out0, out2, out3 = model(images)
+                out, out0, out2, out3, out4 = model(images)
                 loss_main = criterion(out, masks)
-                loss_aux = (criterion(out0, masks) + criterion(out2, masks) + criterion(out3, masks)) / 3
+                loss_aux = (
+                        0.4 * criterion(out0, masks) +
+                        0.4 * criterion(out2, masks) +
+                        0.4 * criterion(out3, masks) +
+                        0.4 * criterion(out4, masks)
+                )
+
                 loss = loss_main + 0.4 * loss_aux
 
                 loss.backward()

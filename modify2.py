@@ -1,7 +1,7 @@
+
 import os
 import random
 import time
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,228 +16,183 @@ from tqdm import tqdm
 
 
 # ==========================================
-# 1. 核心模块：基础特征增强模块
+# 1. 基础组件：MLP 与 前沿特征增强 (LKA)
 # ==========================================
-class Basic_FEB(nn.Module):
-    def __init__(self, in_channels):
-        super(Basic_FEB, self).__init__()
 
-        self.local_conv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True),
+class MLP(nn.Module):
+    """借鉴 SegFormer 的线性层，用于统一通道维度"""
 
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True)
-        )
-
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        mid_channels = max(in_channels // 4, 1)
-        self.channel_att = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, in_channels, 1),
-            nn.Sigmoid()
-        )
+    def __init__(self, input_dim, embed_dim):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, embed_dim)
 
     def forward(self, x):
-        identity = x
-
-        # 1. 局部特征提取
-        feat = self.local_conv(x)
-
-        # 2. 通道注意力加权
-        att_weight = self.channel_att(self.gap(feat))
-        out = feat * att_weight
-
-        # 3. 残差连接
-        return out + identity
-
-
-# ==========================================
-# 2. 注意力卷积块
-# ==========================================
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=8):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        return self.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=3, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        return self.sigmoid(self.conv1(torch.cat([avg_out, max_out], dim=1)))
-
-
-class BottleneckSelfAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(BottleneckSelfAttention, self).__init__()
-        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        b, c, h, w = x.size()
-        proj_query = self.query_conv(x).view(b, -1, h * w).permute(0, 2, 1)
-        proj_key = self.key_conv(x).view(b, -1, h * w)
-
-        energy = torch.bmm(proj_query, proj_key) / ((c // 8) ** 0.5)
-        attention = F.softmax(energy, dim=-1)
-
-        proj_value = self.value_conv(x).view(b, -1, h * w)
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
-
-        out = out.view(b, c, h, w)
-        out = self.gamma * out + x
-
-        return out
-
-
-class AttentionConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super(AttentionConvBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-        self.ca = ChannelAttention(out_ch)
-        self.sa = SpatialAttention()
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = x * self.ca(x)
-        x = x * self.sa(x)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = self.proj(x)
+        x = x.transpose(1, 2).reshape(B, -1, H, W)
         return x
 
 
-class AttentionGate(nn.Module):
-    def __init__(self, F_g, F_l, F_int):
-        super(AttentionGate, self).__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(F_int)
-        )
-        self.W_x = nn.Sequential(
-            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(F_int)
-        )
-        self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid()
-        )
-        self.relu = nn.ReLU(inplace=True)
+class LKA(nn.Module):
+    """
+    大核注意力机制 (Large Kernel Attention)
+    来源: Visual Attention Network (VAN)
+    优势: 结合了局部上下文、长距离依赖和通道适应性，比普通的 SE 通道注意力强很多。
+    """
 
-    def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
-        psi = self.psi(psi)
-        return x * psi
-
-
-# ==========================================
-# 3. 网络主体 (已修改：转置卷积 & 步长为2的卷积)
-# ==========================================
-class HANet_Final(nn.Module):
-    def __init__(self):
-        super(HANet_Final, self).__init__()
-        densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
-        self.encoder = densenet.features
-
-        # 【修改 1】：将 DenseNet 原本的 pool0 (最大池化层) 替换为 步幅为 2 的可学习卷积层
-        # 原本的 self.encoder.conv0 输出通道数为 64
-        self.encoder.pool0 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
-
-        self.ch1, self.ch2, self.ch3, self.ch4 = 64, 256, 512, 1024
-
-        self.feb2 = Basic_FEB(self.ch2)
-        self.feb3 = Basic_FEB(self.ch3)
-
-        self.bottleneck_attn = BottleneckSelfAttention(in_channels=1024)
-        self.ag1 = AttentionGate(F_g=128, F_l=self.ch1, F_int=64)
-
-        # 【修改 2】：将 nn.Upsample 全部替换为 nn.ConvTranspose2d
-        # scale_factor=2 对应 kernel_size=2, stride=2。设置前后通道数一致，交由 dec 融合降维
-        self.up4 = nn.ConvTranspose2d(1024, 1024, kernel_size=2, stride=2)
-        self.dec4 = AttentionConvBlock(1024 + self.ch4, 512)
-
-        self.up3 = nn.ConvTranspose2d(512, 512, kernel_size=2, stride=2)
-        self.dec3 = AttentionConvBlock(512 + self.ch3, 256)
-
-        self.up2 = nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2)
-        self.dec2 = AttentionConvBlock(256 + self.ch2, 128)
-
-        self.up1 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2)
-        self.dec1 = AttentionConvBlock(128 + self.ch1, 64)
-
-        self.up0 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
-        self.dec0 = AttentionConvBlock(64, 32)
-
-        self.out3 = nn.Conv2d(256, 1, kernel_size=1)
-        self.out2 = nn.Conv2d(128, 1, kernel_size=1)
-        self.out1 = nn.Conv2d(64, 1, kernel_size=1)
-        self.final_conv = nn.Conv2d(32, 1, kernel_size=1)
+    def __init__(self, dim):
+        super().__init__()
+        # 1. 提取局部空间特征 (5x5 Depth-wise)
+        self.conv0 = nn.Conv2d(dim, dim, kernel_size=5, padding=2, groups=dim)
+        # 2. 提取长距离空间特征 (5x5 Dilated Depth-wise, dilation=3 相当于 13x13 感受野)
+        self.conv_spatial = nn.Conv2d(dim, dim, kernel_size=5, stride=1, padding=6, groups=dim, dilation=3)
+        # 3. 通道混合 (1x1 Conv)
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=1)
 
     def forward(self, x):
-        # Encoder
+        u = x.clone()
+        attn = self.conv0(x)
+        attn = self.conv_spatial(attn)
+        attn = self.conv1(attn)
+        return u * attn
+
+
+class Modern_FEB_LKA(nn.Module):
+    """使用 LKA 替代普通 Channel Attention 的特征增强模块"""
+
+    def __init__(self, in_channels):
+        super(Modern_FEB_LKA, self).__init__()
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.GELU(),  # GELU 在现代网络中表现通常优于 LeakyReLU
+        )
+        self.lka = LKA(in_channels)
+        self.proj = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        identity = x
+        feat = self.local_conv(x)
+        feat = self.lka(feat)  # 经过大核注意力提取长距离依赖
+        feat = self.proj(feat)
+        return feat + identity
+
+
+class SpatialAttention(nn.Module):
+    """空间注意力机制，用于 MLP 融合后的边缘细节恢复"""
+
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # 在通道维度计算最大值和平均值，突出边缘特征
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        scale = torch.cat([avg_out, max_out], dim=1)
+        scale = self.conv1(scale)
+        return x * self.sigmoid(scale)
+
+
+# ==========================================
+# 2. 网络主体：HANet + 增强型 SegFormer Decoder
+# ==========================================
+
+class HANet_MLP_Final(nn.Module):
+    def __init__(self, embed_dim=256):
+        super(HANet_MLP_Final, self).__init__()
+        # Encoder: DenseNet121
+        densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+        self.encoder = densenet.features
+        self.ch0, self.ch2, self.ch3, self.ch_b = 64, 256, 512, 1024
+
+        # 引入前沿的 LKA 特征增强
+        self.feb2 = Modern_FEB_LKA(self.ch2)
+        self.feb3 = Modern_FEB_LKA(self.ch3)
+
+        # MLP 投影层
+        self.linear0 = MLP(self.ch0, embed_dim)
+        self.linear2 = MLP(self.ch2, embed_dim)
+        self.linear3 = MLP(self.ch3, embed_dim)
+        self.linear_b = MLP(self.ch_b, embed_dim)
+
+        # 融合层
+        self.linear_fuse = nn.Sequential(
+            nn.Conv2d(embed_dim * 4, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.GELU()
+        )
+
+        # 增加空间边缘增强模块
+        self.spatial_refine = SpatialAttention(kernel_size=7)
+
+        # 最终预测
+        self.final_conv = nn.Conv2d(embed_dim, 1, kernel_size=1)
+
+        # 辅助输出头 (用于 Deep Supervision)
+        self.aux0 = nn.Conv2d(embed_dim, 1, kernel_size=1)
+        self.aux2 = nn.Conv2d(embed_dim, 1, kernel_size=1)
+        self.aux3 = nn.Conv2d(embed_dim, 1, kernel_size=1)
+
+    def forward(self, x):
+        # 1. Encoder
         e0 = self.encoder.relu0(self.encoder.norm0(self.encoder.conv0(x)))
         e2 = self.encoder.denseblock1(self.encoder.pool0(e0))
         e3 = self.encoder.denseblock2(self.encoder.transition1(e2))
         e4 = self.encoder.denseblock3(self.encoder.transition2(e3))
         b = self.encoder.norm5(self.encoder.denseblock4(self.encoder.transition3(e4)))
 
-        b = self.bottleneck_attn(b)
+        # 2. LKA 特征增强
+        s2 = self.feb2(e2)
+        s3 = self.feb3(e3)
 
-        skip1 = e0
-        skip2 = self.feb2(e2)
-        skip3 = self.feb3(e3)
-        skip4 = e4
+        # 3. All-MLP Decoder 过程
+        target_size = e0.size()[2:]
+        _l0 = self.linear0(e0)
+        _l2 = F.interpolate(self.linear2(s2), size=target_size, mode='bilinear', align_corners=False)
+        _l3 = F.interpolate(self.linear3(s3), size=target_size, mode='bilinear', align_corners=False)
+        _lb = F.interpolate(self.linear_b(b), size=target_size, mode='bilinear', align_corners=False)
 
-        # Decoder 融合
-        d4 = self.dec4(torch.cat([self.up4(b), skip4], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), skip3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), skip2], dim=1))
+        # 4. 融合与空间细化
+        fused = self.linear_fuse(torch.cat([_l0, _l2, _l3, _lb], dim=1))
+        fused = self.spatial_refine(fused)  # <-- 新增：强化融合后的边界特征
 
-        up_d2 = self.up1(d2)
-        skip1_gated = self.ag1(g=up_d2, x=skip1)
-        d1 = self.dec1(torch.cat([up_d2, skip1_gated], dim=1))
-
-        # 主输出
-        out = torch.sigmoid(self.final_conv(self.dec0(self.up0(d1))))
+        # 5. 输出
+        out = torch.sigmoid(
+            F.interpolate(self.final_conv(fused), size=x.size()[2:], mode='bilinear', align_corners=False))
 
         if self.training:
-            out1 = torch.sigmoid(self.out1(d1))
-            out2 = torch.sigmoid(self.out2(d2))
-            out3 = torch.sigmoid(self.out3(d3))
-            return out, out1, out2, out3
+            out0 = torch.sigmoid(F.interpolate(self.aux0(_l0), size=x.size()[2:], mode='bilinear', align_corners=False))
+            out2 = torch.sigmoid(F.interpolate(self.aux2(_l2), size=x.size()[2:], mode='bilinear', align_corners=False))
+            out3 = torch.sigmoid(F.interpolate(self.aux3(_lb), size=x.size()[2:], mode='bilinear', align_corners=False))
+            return out, out0, out2, out3
         else:
             return out
 
 
+class HybridLoss(nn.Module):
+    def __init__(self, weight_focal=0.5, weight_dice=0.5):
+        super(HybridLoss, self).__init__()
+        self.focal = FocalLoss()  # 替换掉了原有的 BCE
+        self.weight_focal = weight_focal
+        self.weight_dice = weight_dice
+
+    def forward(self, pred, target):
+        focal_loss = self.focal(pred, target)
+        smooth = 1e-5
+        pred_flat = pred.view(pred.size(0), -1)
+        target_flat = target.view(target.size(0), -1)
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        dice_score = (2.0 * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
+        dice_loss = 1.0 - dice_score
+        return (self.weight_focal * focal_loss) + (self.weight_dice * dice_loss.mean())
+
+
+# 其他计算指标代码和 main 函数保持原样即可...
 # ==========================================
 # 4. 混合损失函数与评估指标
 # ==========================================
@@ -355,7 +310,7 @@ def main():
     train_size = int(0.8 * total_size)
     val_size = int(0.1 * total_size)
 
-    model = HANet_Final().to(device)
+    model = HANet_MLP_Final().to(device)
 
     if MODE == "train":
         train_loader = DataLoader(BUSIDataset(all_imgs[:train_size], all_masks[:train_size], True), batch_size=8,
@@ -366,7 +321,7 @@ def main():
 
         criterion = HybridLoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 35
+        num_epochs = 15
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
