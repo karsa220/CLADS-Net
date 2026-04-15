@@ -17,9 +17,9 @@ import matplotlib.pyplot as plt  # 【新增】导入 matplotlib 用于绘图
 # ==========================================
 # 1. 评估指标与损失函数 (修改为标准的 BCE + Dice Loss)
 # ==========================================
-class BCEDiceLoss(nn.Module):
+class HybridLoss(nn.Module):
     def __init__(self, weight_bce=0.4, weight_dice=0.6):
-        super(BCEDiceLoss, self).__init__()
+        super(HybridLoss, self).__init__()
         self.bce = nn.BCELoss()
         self.weight_bce = weight_bce
         self.weight_dice = weight_dice
@@ -40,31 +40,20 @@ class BCEDiceLoss(nn.Module):
 
 
 def calculate_metrics(pred, target, smooth=1e-5):
-    """计算 ACC, PRECISION, RECALL, IOU, DICE"""
     pred_bin = (pred > 0.5).float()
     target_bin = target.float()
-
     pred_flat = pred_bin.view(pred_bin.size(0), -1)
     target_flat = target_bin.view(target_bin.size(0), -1)
-
     tp = (pred_flat * target_flat).sum(dim=1)
     fp = (pred_flat * (1 - target_flat)).sum(dim=1)
     fn = ((1 - pred_flat) * target_flat).sum(dim=1)
     tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
-
     dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
     iou = (tp + smooth) / (tp + fp + fn + smooth)
     acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
     pre = (tp + smooth) / (tp + fp + smooth)
     rec = (tp + smooth) / (tp + fn + smooth)
-
-    return {
-        "dice": dice.tolist(),
-        "iou": iou.tolist(),
-        "acc": acc.tolist(),
-        "pre": pre.tolist(),
-        "rec": rec.tolist()
-    }
+    return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
 
 
 # ==========================================
@@ -206,7 +195,7 @@ def main():
     MODE = "train"  # 改为 "train" 进行训练并生成图表
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
-    save_path = "best_HiFormer.pth"
+    save_path = "best_busi.pth"
     plot_save_path = "training_curve.png"  # 【新增】图表保存路径
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -235,10 +224,9 @@ def main():
         val_loader = DataLoader(BUSIDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False),
                                 batch_size=10, shuffle=False)
 
-        criterion = BCEDiceLoss()
-        optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001)
-
-        num_epochs = 45
+        criterion = HybridLoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+        num_epochs = 35
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -312,72 +300,67 @@ def main():
         plt.close()
         print(f"✅ 训练曲线已成功保存至当前目录: {plot_save_path}")
 
+    print("\n" + "=" * 50)
+    print("🚀 开始在测试集上评估 HiFormer 最终性能...")
 
-    # ==========================
-    # 模式 B：纯测试 / 评估模式
-    # ==========================
-    elif MODE == "test":
-        print("\n" + "=" * 50)
-        print("🚀 开始在测试集上评估 HiFormer 最终性能...")
+    test_loader = DataLoader(BUSIDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
+                             batch_size=10,
+                             shuffle=False)
 
-        test_loader = DataLoader(BUSIDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
-                                 batch_size=10,
-                                 shuffle=False)
+    if not os.path.exists(save_path):
+        print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
+        return
 
-        if not os.path.exists(save_path):
-            print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
-            return
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    model.eval()
 
-        model.load_state_dict(torch.load(save_path, map_location=device))
-        model.eval()
+    test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
 
-        test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
+    print("🔥 正在进行 GPU 预热 (Warm-up)...")
+    dummy_input = torch.randn(1, 3, 224, 224).to(device)
+    with torch.no_grad():
+        for _ in range(10):
+            _ = model(dummy_input)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
-        print("🔥 正在进行 GPU 预热 (Warm-up)...")
-        dummy_input = torch.randn(1, 3, 224, 224).to(device)
-        with torch.no_grad():
-            for _ in range(10):
-                _ = model(dummy_input)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+    total_infer_time = 0.0
+    total_samples = 0
 
-        total_infer_time = 0.0
-        total_samples = 0
+    with torch.no_grad():
+        for images, masks in tqdm(test_loader, desc="Testing"):
+            images, masks = images.to(device), masks.to(device)
 
-        with torch.no_grad():
-            for images, masks in tqdm(test_loader, desc="Testing"):
-                images, masks = images.to(device), masks.to(device)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.time()
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                start_time = time.time()
+            outputs = model(images)
 
-                outputs = model(images)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = time.time()
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                end_time = time.time()
+            total_infer_time += (end_time - start_time)
+            total_samples += images.size(0)
 
-                total_infer_time += (end_time - start_time)
-                total_samples += images.size(0)
+            metrics = calculate_metrics(outputs, masks)
+            for k in test_res.keys():
+                test_res[k].extend(metrics[k])
 
-                metrics = calculate_metrics(outputs, masks)
-                for k in test_res.keys():
-                    test_res[k].extend(metrics[k])
-
-        avg_time_per_image = (total_infer_time / total_samples) * 1000
-        fps = 1.0 / (total_infer_time / total_samples)
-        print("\n🏆 HiFormer 最终测试集成绩 🏆")
-        print(f"🔹 Dice (F1): {np.mean(test_res['dice']):.4f}")
-        print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
-        print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
-        print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
-        print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
-        print("-" * 50)
-        print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
-        print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
-        print(f"🚀 F P S    : {fps:.2f} frames / second")
-        print("=" * 50)
+    avg_time_per_image = (total_infer_time / total_samples) * 1000
+    fps = 1.0 / (total_infer_time / total_samples)
+    print("\n🏆 HiFormer 最终测试集成绩 🏆")
+    print(f"🔹 Dice (F1): {np.mean(test_res['dice']):.4f}")
+    print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
+    print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
+    print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
+    print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
+    print("-" * 50)
+    print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
+    print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
+    print(f"🚀 F P S    : {fps:.2f} frames / second")
+    print("=" * 50)
 
 
 if __name__ == "__main__":

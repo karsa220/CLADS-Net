@@ -253,7 +253,7 @@ def get_dataset_paths(data_dir):
 
 def main():
     MODE = "train"
-    save_path = "best_model_mlp_decoder.pth"
+    save_path = "best_BUSI.pth"
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"  # 请根据实际修改
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

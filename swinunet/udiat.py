@@ -13,10 +13,10 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from modify2 import HybridLoss
-from modifying import HANet_Final, calculate_metrics
-from swinunet.main import SwinUNet_Hybrid
+from swinunet.main import HybridLoss
 
+from swinunet.main import SwinUNet_Hybrid
+from swinunet.main import calculate_metrics
 
 # ==========================================
 # 6. UDIAT 数据集加载 (原图/GT结构)
@@ -91,9 +91,12 @@ def get_udiat_paths(data_dir):
 # ==========================================
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
-    MODE = "train"  # "train" 训练 | "test" 直接评估
+    MODE = "train"  # "train" 训练(微调) | "test" 直接评估
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
-    save_path = "best_HANet_UDIAT.pth"
+
+    # 🚀 修改 1：定义预训练权重和新权重的路径
+    pretrained_busi_path = "best_busi.pth"
+    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
@@ -112,14 +115,26 @@ def main():
     model = SwinUNet_Hybrid().to(device)
 
     if MODE == "train":
+        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        if os.path.exists(pretrained_busi_path):
+            print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
+            model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
+            print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
+        else:
+            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！")
+
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
         val_loader = DataLoader(
             UDIATDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False), batch_size=8,
             shuffle=False)
 
         criterion = HybridLoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 40
+
+        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
+        fine_tune_lr = 1e-4
+        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+
+        num_epochs = 50
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -134,18 +149,7 @@ def main():
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
                 outputs = model(images)
-
-                # 深度监督 Loss 计算
-                if isinstance(outputs, tuple):
-                    out, out1, out2, out3 = outputs
-                    loss_main = criterion(out, masks)
-                    ts = masks.shape[2:]
-                    loss_aux = sum(
-                        criterion(F.interpolate(o, size=ts, mode='bilinear', align_corners=True), masks) for o in
-                        [out1, out2, out3])
-                    loss = loss_main + 0.4 * loss_aux
-                else:
-                    loss = criterion(outputs, masks)
+                loss = criterion(outputs, masks)
 
                 loss.backward()
                 optimizer.step()
@@ -160,7 +164,7 @@ def main():
             with torch.no_grad():
                 for images, masks in val_loader:
                     out = model(images.to(device))
-                    # 防御性编程：万一 eval 模式下返回了 tuple，取主输出
+                    # 适配你的输出元组形式或单输出形式
                     if isinstance(out, tuple): out = out[0]
                     val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
@@ -174,10 +178,11 @@ def main():
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
+                # 🚀 修改 4：保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
-                print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f}")
+                print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
-        # 训练结束后静态绘制曲线图 (避免环境 GUI 兼容性报错)
+        # 训练结束后静态绘制曲线图
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1);
         plt.plot(history_loss, marker='o');
@@ -188,15 +193,15 @@ def main():
         plt.title("Val Dice");
         plt.grid()
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT.png")
-
+        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
 
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的测试集上评估...")
     test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
                              batch_size=1, shuffle=False)
 
+    # 测试阶段：加载微调后保存的最新权重
     if not os.path.exists(save_path):
         print(f"❌ 找不到权重文件 {save_path}！请先运行 train 模式。")
         return
@@ -228,7 +233,7 @@ def main():
             m = calculate_metrics(outputs, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 HANet_Final (UDIAT) 测试集最终成绩 🏆")
+    print("\n🏆 swinunet (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
@@ -237,7 +242,6 @@ def main():
     print(
         f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
     print("=" * 50)
-
 
 if __name__ == "__main__":
     main()

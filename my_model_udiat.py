@@ -13,8 +13,8 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from modify2 import HybridLoss
-from modifying import calculate_metrics, HANet_MLP_Final
+from CLADS_Net_busi import HybridLoss
+from CLADS_Net_busi import calculate_metrics, CLADS_Net
 
 
 # ==========================================
@@ -90,7 +90,7 @@ def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
     MODE = "train"  # "train" 训练 | "test" 直接评估
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
-    save_path = "best_HANet_UDIAT.pth"
+    save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
@@ -106,7 +106,7 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = HANet_MLP_Final().to(device)
+    model = CLADS_Net().to(device)
 
     if MODE == "train":
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)

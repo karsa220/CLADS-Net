@@ -4,191 +4,80 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
-from tqdm import tqdm
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from hiformer.main import HybridLoss
 
 
-# ==========================================
-# 1. 评估指标与损失函数 (保持不变)
-# ==========================================
-class BCEDiceLoss(nn.Module):
-    def __init__(self, weight_bce=0.4, weight_dice=0.6):
-        super(BCEDiceLoss, self).__init__()
-        self.bce = nn.BCELoss()
-        self.weight_bce = weight_bce
-        self.weight_dice = weight_dice
-
-    def forward(self, pred, target):
-        bce_loss = self.bce(pred, target)
-        smooth = 1e-5
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        dice_score = (2. * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
-        dice_loss = 1.0 - dice_score
-        return (self.weight_bce * bce_loss) + (self.weight_dice * dice_loss.mean())
-
-
-def calculate_metrics(pred, target, smooth=1e-5):
-    pred_bin = (pred > 0.5).float()
-    target_bin = target.float()
-    pred_flat = pred_bin.view(pred_bin.size(0), -1)
-    target_flat = target_bin.view(target_bin.size(0), -1)
-    tp = (pred_flat * target_flat).sum(dim=1)
-    fp = (pred_flat * (1 - target_flat)).sum(dim=1)
-    fn = ((1 - pred_flat) * target_flat).sum(dim=1)
-    tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
-    dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
-    iou = (tp + smooth) / (tp + fp + fn + smooth)
-    acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
-    pre = (tp + smooth) / (tp + fp + smooth)
-    rec = (tp + smooth) / (tp + fn + smooth)
-    return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
-
+from hiformer.main import calculate_metrics
 
 # ==========================================
-# 2. HiFormer 模型基线 (保持不变)
-# ==========================================
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x): return self.conv(x)
-
-
-class DoubleLevelFusion(nn.Module):
-    def __init__(self, cnn_dim, vit_dim, out_dim):
-        super().__init__()
-        self.cnn_proj = nn.Sequential(nn.Conv2d(cnn_dim, out_dim, 1, bias=False), nn.BatchNorm2d(out_dim),
-                                      nn.ReLU(True))
-        self.vit_proj = nn.Sequential(nn.Conv2d(vit_dim, out_dim, 1, bias=False), nn.BatchNorm2d(out_dim),
-                                      nn.ReLU(True))
-        self.fusion_conv = nn.Sequential(nn.Conv2d(out_dim * 2, out_dim, 3, padding=1, bias=False),
-                                         nn.BatchNorm2d(out_dim), nn.ReLU(True))
-        self.channel_att = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(out_dim, out_dim // 4, 1), nn.ReLU(True),
-                                         nn.Conv2d(out_dim // 4, out_dim, 1), nn.Sigmoid())
-
-    def forward(self, cnn_feat, vit_feat):
-        c_feat = self.cnn_proj(cnn_feat)
-        v_feat = self.vit_proj(vit_feat)
-        fused = self.fusion_conv(torch.cat([c_feat, v_feat], dim=1))
-        return fused * self.channel_att(fused) + c_feat
-
-
-class HiFormer_Baseline(nn.Module):
-    def __init__(self):
-        super().__init__()
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)
-        self.pool = resnet.maxpool
-        self.cnn_layer1, self.cnn_layer2, self.cnn_layer3 = resnet.layer1, resnet.layer2, resnet.layer3
-        self.patch_embed = nn.Conv2d(3, 512, 16, 16)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 256, 512))
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=512, nhead=8, dim_feedforward=2048, activation='gelu', batch_first=True),
-            num_layers=4)
-        self.vit_up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dlf_1 = DoubleLevelFusion(512, 512, 256)
-        self.dlf_2 = DoubleLevelFusion(1024, 512, 512)
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec4 = ConvBlock(512 + 256, 256)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec3 = ConvBlock(256 + 256, 128)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec2 = ConvBlock(128 + 64, 64)
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec1 = ConvBlock(64, 32)
-        self.final_conv = nn.Conv2d(32, 1, 1)
-
-    def forward(self, x):
-        B, _, H, W = x.shape
-        e0 = self.stem(x)
-        e1 = self.cnn_layer1(self.pool(e0))
-        e2 = self.cnn_layer2(e1)
-        e3 = self.cnn_layer3(e2)
-        v_patch = self.patch_embed(x).flatten(2).transpose(1, 2)
-        v_trans = self.transformer(v_patch + self.pos_embed[:, :v_patch.shape[1], :])
-        v_feat = v_trans.transpose(1, 2).reshape(B, -1, H // 16, W // 16)
-        feat_dlf2 = self.dlf_2(e3, v_feat)
-        feat_dlf1 = self.dlf_1(e2, self.vit_up1(v_feat))
-        d4 = self.dec4(torch.cat([self.up4(feat_dlf2), feat_dlf1], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), e1], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e0], dim=1))
-        out = torch.sigmoid(self.final_conv(self.dec1(self.up1(d2))))
-        return out
-
-
-# ==========================================
-# 3. UDIAT 数据集加载逻辑 (重点修改部分)
+# 6. UDIAT 数据集加载 (原图/GT结构)
 # ==========================================
 class UDIATDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
-        self.image_paths = image_paths
-        self.mask_paths = mask_paths
-        self.is_train = is_train
+        self.image_paths, self.mask_paths, self.is_train = image_paths, mask_paths, is_train
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        # 加载图像和掩码
-        img = Image.open(self.image_paths[idx]).convert('RGB')
+        image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        # 调整大小
-        img = TF.resize(img, (224, 224))
-        mask = TF.resize(mask, (224, 224))
+        image = TF.resize(image, (256, 256))
+        mask = TF.resize(mask, (256, 256))
 
         if self.is_train:
+            # 1. 随机水平翻转
             if random.random() > 0.5:
-                img, mask = TF.hflip(img), TF.hflip(mask)
-            if random.random() > 0.5:
-                img, mask = TF.vflip(img), TF.vflip(mask)
+                image = TF.hflip(image)
+                mask = TF.hflip(mask)
+            # 2. 随机旋转
             angle = random.uniform(-15, 15)
-            img, mask = TF.rotate(img, angle), TF.rotate(mask, angle)
+            image = TF.rotate(image, angle)
+            mask = TF.rotate(mask, angle)
 
-        return TF.to_tensor(img), TF.to_tensor(mask)
+            # 3. 增加一点尺度缩放和平移 (超声图像中病灶大小差异很大)
+            if random.random() > 0.5:
+                scale = random.uniform(0.9, 1.1)
+                translate = [int(random.uniform(-10, 10)), int(random.uniform(-10, 10))]
+                image = TF.affine(image, angle=0, translate=translate, scale=scale, shear=0)
+                mask = TF.affine(mask, angle=0, translate=translate, scale=scale, shear=0)
+
+        image = TF.to_tensor(image)
+        mask = TF.to_tensor(mask)
+
+        # 【关键修复】加上 ImageNet Normalization
+        image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        return image, mask
 
 
 def get_udiat_paths(data_dir):
-    """
-    针对 UDIAT 数据集结构：
-    data_dir/
-      ├── original/ (000001.PNG, ...)
-      └── GT/       (000001.PNG, ...)
-    """
-    img_dir = os.path.join(data_dir, 'original')
-    gt_dir = os.path.join(data_dir, 'GT')
-
-    img_p, mask_p = [], []
-
+    img_dir, gt_dir = os.path.join(data_dir, 'original'), os.path.join(data_dir, 'GT')
     if not os.path.exists(img_dir) or not os.path.exists(gt_dir):
-        print(f"❌ 路径不存在: 请确保存在 {img_dir} 和 {gt_dir}")
+        print(f"❌ 路径错误: 找不到 original 或 GT 文件夹于 {data_dir}")
         return [], []
 
-    # 遍历 original 文件夹
-    filenames = sorted(os.listdir(img_dir))
-    for f in filenames:
+    img_p, mask_p = [], []
+    for f in sorted(os.listdir(img_dir)):
         if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-            img_path = os.path.join(img_dir, f)
-            mask_path = os.path.join(gt_dir, f)  # UDIAT 通常原图和掩码文件名完全一致
-
+            img_path, mask_path = os.path.join(img_dir, f), os.path.join(gt_dir, f)
             if os.path.exists(mask_path):
                 img_p.append(img_path)
                 mask_p.append(mask_path)
             else:
-                # 兼容部分数据集大小写不一致的情况
-                alt_mask_path = os.path.join(gt_dir,
-                                             f.replace('.PNG', '.png') if '.PNG' in f else f.replace('.png', '.PNG'))
+                # 兼容大小写差异（如 .PNG 和 .png）
+                alt_f = f.replace('.PNG', '.png') if '.PNG' in f else f.replace('.png', '.PNG')
+                alt_mask_path = os.path.join(gt_dir, alt_f)
                 if os.path.exists(alt_mask_path):
                     img_p.append(img_path)
                     mask_p.append(alt_mask_path)
@@ -198,129 +87,162 @@ def get_udiat_paths(data_dir):
 
 
 # ==========================================
-# 4. 主控台
+# 7. 主控台
 # ==========================================
 def main():
-    # 🌟🌟🌟 配置面板 🌟🌟🌟
-    MODE = "test"
-    data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 修改为你的 UDIAT 数据集根目录
-    save_path = "best_HiFormer_UDIAT.pth"
-    plot_save_path = "training_curve_udiat.png"
+    # 🌟🌟🌟 控制面板 🌟🌟🌟
+    MODE = "train"  # "train" 训练(微调) | "test" 直接评估
+    data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
+
+    # 🚀 修改 1：定义预训练权重和新权重的路径
+    pretrained_busi_path = "best_busi.pth"
+    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
 
-    # 获取 UDIAT 路径
     all_imgs, all_masks = get_udiat_paths(data_dir)
-    if len(all_imgs) == 0:
-        return
+    if not all_imgs: return
 
-    # 打乱并划分
     combined = list(zip(all_imgs, all_masks))
     random.seed(42)
     random.shuffle(combined)
     all_imgs, all_masks = zip(*combined)
 
-    total_size = len(all_imgs)
-    # 划分比例: 80% 训练, 10% 验证, 10% 测试
-    t_size = int(0.8 * total_size)
-    v_size = int(0.1 * total_size)
+    total = len(all_imgs)
+    t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = HiFormer_Baseline().to(device)
+    from hiformer.main import HiFormer
+    model = HiFormer().to(device)
 
     if MODE == "train":
+        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        if os.path.exists(pretrained_busi_path):
+            print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
+            model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
+            print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
+        else:
+            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！")
+
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
         val_loader = DataLoader(
             UDIATDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False), batch_size=8,
             shuffle=False)
 
-        criterion = BCEDiceLoss()
-        optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001)
-        num_epochs = 40
+        criterion = HybridLoss()
+
+        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
+        fine_tune_lr = 1e-4
+        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+
+        num_epochs = 50
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
-        history_train_loss, history_val_dice = [], []
+        history_loss, history_val_dice = [], []
 
         for epoch in range(num_epochs):
             model.train()
             train_loss_epoch = 0.0
             pbar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{num_epochs}]", leave=False)
+
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
-                out = model(images)
-                loss = criterion(out, masks)
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+
                 loss.backward()
                 optimizer.step()
                 train_loss_epoch += loss.item()
+                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
 
+            avg_train_loss = train_loss_epoch / len(train_loader)
+
+            # 验证评估
             model.eval()
             val_dices = []
             with torch.no_grad():
                 for images, masks in val_loader:
-                    metrics = calculate_metrics(model(images.to(device)), masks.to(device))
-                    val_dices.extend(metrics["dice"])
+                    out = model(images.to(device))
+                    # 适配你的输出元组形式或单输出形式
+                    if isinstance(out, tuple): out = out[0]
+                    val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
-            avg_train_loss = train_loss_epoch / len(train_loader)
             avg_val_dice = np.mean(val_dices)
             scheduler.step()
-
-            history_train_loss.append(avg_train_loss)
+            history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
 
-            print(f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f}")
+            print(
+                f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
+                # 🚀 修改 4：保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
-                print(f"🌟 Saved New Best Model!")
+                print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
-        # 绘图
-        plt.figure(figsize=(10, 4))
+        # 训练结束后静态绘制曲线图
+        plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1);
-        plt.plot(history_train_loss);
-        plt.title("Loss")
+        plt.plot(history_loss, marker='o');
+        plt.title("Train Loss");
+        plt.grid()
         plt.subplot(1, 2, 2);
-        plt.plot(history_val_dice);
-        plt.title("Val Dice")
-        plt.savefig(plot_save_path);
-        plt.close()
-        print(f"✅ 训练完成，曲线已保存。")
+        plt.plot(history_val_dice, marker='s', color='orange');
+        plt.title("Val Dice");
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
 
-    # ==========================
-    # 纯测试 / 评估模式
-    # ==========================
+    print("\n" + "=" * 50)
+    print("🚀 开始在完全未见的测试集上评估...")
     test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
                              batch_size=1, shuffle=False)
+
+    # 测试阶段：加载微调后保存的最新权重
     if not os.path.exists(save_path):
-        print(f"❌ 找不到模型权重文件: {save_path}")
+        print(f"❌ 找不到权重文件 {save_path}！请先运行 train 模式。")
         return
 
-    model.load_state_dict(torch.load(save_path))
+    model.load_state_dict(torch.load(save_path, map_location=device))
     model.eval()
 
-    # 👉 修改点 1：在这里把缺少的 3 个指标（acc, pre, rec）加上
+    print("🔥 GPU 预热 (Warm-up)...")
+    with torch.no_grad():
+        for _ in range(5): model(torch.randn(1, 3, 256, 256).to(device))
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+
     test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
+    total_time, total_samples = 0.0, 0
 
     with torch.no_grad():
         for images, masks in tqdm(test_loader, desc="Testing"):
-            outputs = model(images.to(device))
-            m = calculate_metrics(outputs, masks.to(device))
+            images, masks = images.to(device), masks.to(device)
 
-            # 👉 修改点 2：把所有指标都存进字典里
-            for key in test_res.keys():
-                test_res[key].extend(m[key])
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            t0 = time.time()
+            outputs = model(images)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
 
-    # 👉 修改点 3：把所有指标都打印出来
-    print(f"\n🏆 UDIAT 测试结果:")
-    print(f"🔹 Dice (F1): {np.mean(test_res['dice']):.4f}")
-    print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
-    print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
-    print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
-    print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
-    print("=" * 30)
+            total_time += (time.time() - t0)
+            total_samples += images.size(0)
 
+            if isinstance(outputs, tuple): outputs = outputs[0]
+            m = calculate_metrics(outputs, masks)
+            for k in test_res: test_res[k].extend(m[k])
+
+    print("\n🏆 hiformer (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
+    print(
+        f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
+    print("-" * 50)
+    print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
+    print(
+        f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
+    print("=" * 50)
 
 if __name__ == "__main__":
     main()

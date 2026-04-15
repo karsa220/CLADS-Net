@@ -6,7 +6,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
 
-from my_model_busi import HANet_Final
+from CLADS_Net_busi import HANet_Final
 
 
 # 如果你的 HANet_Final 模型代码保存在其他文件 (比如 model.py)，请在这里导入
