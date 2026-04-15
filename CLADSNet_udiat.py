@@ -13,8 +13,8 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from CLADS_Net_busi import HybridLoss
-from CLADS_Net_busi import calculate_metrics, CLADS_Net
+from CLADSNet_busi import HybridLoss
+from CLADSNet_busi import calculate_metrics, CLADS_Net
 
 
 # ==========================================
