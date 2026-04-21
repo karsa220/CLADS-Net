@@ -11,7 +11,6 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
@@ -77,8 +76,8 @@ class MLP(nn.Module):
         x = x.transpose(1, 2).reshape(B, -1, H, W)
         return x
 
-
-class Basic_FEB_Leaky(nn.Module):
+#(Leaky Residual Channel Attention Block)
+class LeakyRCAB(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.local_conv = nn.Sequential(
@@ -104,8 +103,8 @@ class Basic_FEB_Leaky(nn.Module):
         att = self.channel_att(self.gap(feat))
         return feat * att + identity
 
-
-class HANet_MLP_Final(nn.Module):
+# (Cross-scale Leaky Attention with Deep Supervision)
+class CLADS_Net(nn.Module):
     def __init__(self, embed_dim=256):
         super().__init__()
 
@@ -115,9 +114,9 @@ class HANet_MLP_Final(nn.Module):
         self.ch0, self.ch2, self.ch3 = 64, 256, 512
         self.ch4, self.ch_b = 1024, 1024
 
-        self.feb2 = Basic_FEB_Leaky(self.ch2)
-        self.feb3 = Basic_FEB_Leaky(self.ch3)
-        self.feb4 = Basic_FEB_Leaky(self.ch4)
+        self.rcab2 = LeakyRCAB(self.ch2)
+        self.rcab3 = LeakyRCAB(self.ch3)
+        self.rcab4 = LeakyRCAB(self.ch4)
 
         self.linear0 = MLP(self.ch0, embed_dim)
         self.linear2 = MLP(self.ch2, embed_dim)
@@ -145,9 +144,9 @@ class HANet_MLP_Final(nn.Module):
         e4 = self.encoder.denseblock3(self.encoder.transition2(e3))
         b = self.encoder.norm5(self.encoder.denseblock4(self.encoder.transition3(e4)))
 
-        s2 = self.feb2(e2)
-        s3 = self.feb3(e3)
-        s4 = self.feb4(e4)
+        s2 = self.rcab2(e2)
+        s3 = self.rcab3(e3)
+        s4 = self.rcab4(e4)
 
         target_size = e0.shape[2:]
 
@@ -272,7 +271,7 @@ def main():
     val_size = int(0.1 * total_size)
 
     # 实例化新模型
-    model = HANet_MLP_Final(embed_dim=256).to(device)
+    model = CLADS_Net(embed_dim=256).to(device)
 
     if MODE == "train":
         train_loader = DataLoader(BUSIDataset(all_imgs[:train_size], all_masks[:train_size], True), batch_size=8,
