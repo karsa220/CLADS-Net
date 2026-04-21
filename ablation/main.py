@@ -289,10 +289,10 @@ def main():
         "3. + CSMA Only": {"use_rcab": False, "use_csma": True, "use_deep_sup": False},
         "4. + Deep Sup. Only": {"use_rcab": False, "use_csma": False, "use_deep_sup": True},
 
-      #  "w/o CSMA (No Cross-Scale Attn)": {"use_rcab": True, "use_csma": False, "use_deep_sup": True},
-      #  "w/o RCAB (No Channel Attn)": {"use_rcab": False, "use_csma": True, "use_deep_sup": True},
-      #  "w/o DeepSup (No Aux Loss)": {"use_rcab": True, "use_csma": True, "use_deep_sup": False},
-       # "Vanilla (No Custom Modules)": {"use_rcab": False, "use_csma": False, "use_deep_sup": False},
+       "w/o CSMA (No Cross-Scale Attn)": {"use_rcab": True, "use_csma": False, "use_deep_sup": True},
+      "w/o RCAB (No Channel Attn)": {"use_rcab": False, "use_csma": True, "use_deep_sup": True},
+      "w/o DeepSup (No Aux Loss)": {"use_rcab": True, "use_csma": True, "use_deep_sup": False},
+       "Vanilla (No Custom Modules)": {"use_rcab": False, "use_csma": False, "use_deep_sup": False},
     }
 
     results = {}

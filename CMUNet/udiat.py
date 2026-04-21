@@ -233,7 +233,7 @@ def main():
             m = calculate_metrics(outputs, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 MKUnet (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print("\n🏆 CMUnet (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")

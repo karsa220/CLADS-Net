@@ -390,7 +390,7 @@ def main():
 
             avg_time_per_image = (total_infer_time / total_samples) * 1000
             fps = 1.0 / (total_infer_time / total_samples)
-            print("\n🏆 unetplusplus (BUSI dataset)  最终测试集成绩 🏆")
+            print("\n🏆 transunet (BUSI dataset)  最终测试集成绩 🏆")
             print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
             print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
             print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
