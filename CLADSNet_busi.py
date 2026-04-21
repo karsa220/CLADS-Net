@@ -80,7 +80,7 @@ class MLP(nn.Module):
 class LeakyRCAB(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.local_conv = nn.Sequential(
+        self.LConv = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.LeakyReLU(0.01, inplace=True),
@@ -99,7 +99,7 @@ class LeakyRCAB(nn.Module):
 
     def forward(self, x):
         identity = x
-        feat = self.local_conv(x)
+        feat = self.LConv(x)
         att = self.channel_att(self.gap(feat))
         return feat * att + identity
 
