@@ -9,59 +9,43 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
+import torchvision.models as models  # 新增：用于加载预训练骨干网络
 from PIL import Image
 from tqdm import tqdm
+import matplotlib.subplots as plt_subplots
 import matplotlib.pyplot as plt
 
 
+class HybridLoss(nn.Module):
+    def __init__(self, weight_bce=0.4, weight_dice=0.6):
+        super(HybridLoss, self).__init__()
+        self.bce = nn.BCELoss()
+        self.weight_bce = weight_bce
+        self.weight_dice = weight_dice
+
+    def forward(self, pred, target):
+        bce_loss = self.bce(pred, target)
+        smooth = 1e-5
+        pred_flat = pred.view(pred.size(0), -1)
+        target_flat = target.view(target.size(0), -1)
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        dice_score = (2.0 * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
+        dice_loss = 1.0 - dice_score
+        return (self.weight_bce * bce_loss) + (self.weight_dice * dice_loss.mean())
+
+
 # ==========================================
-# 1. ConDSeg 基础网络 (AAAI 2025 简化基线)
+# 1. 结合预训练权重的 ConDSeg 基线
 # ==========================================
-
-class DoubleConv(nn.Module):
-    """标准 CNN 编码器模块: (Conv2d => BatchNorm => ReLU) * 2"""
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        return self.double_conv(x)
-
-
-class Down(nn.Module):
-    """下采样块"""
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels)
-        )
-
-    def forward(self, x):
-        return self.maxpool_conv(x)
-
 
 class SizeAwareBlock(nn.Module):
     """
-    尺寸感知解码块 (Size-Aware Decoder Block)
-    参考 ConDSeg (AAAI 2025) 思想构建：通过并行多尺度卷积核，
-    同时捕获大尺寸共现特征与小尺寸软边界特征。
+    尺寸感知解码块 (Size-Aware Decoder Block) - 核心模块保持不变
     """
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        # 3x3 卷积提取精细局部特征
         self.conv3 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        # 5x5 感受野提取更大范围语义结构
         self.conv5 = nn.Conv2d(in_channels, out_channels, kernel_size=5, padding=2, bias=False)
 
         self.fuse = nn.Conv2d(out_channels * 2, out_channels, kernel_size=1, bias=False)
@@ -71,7 +55,6 @@ class SizeAwareBlock(nn.Module):
     def forward(self, x):
         x3 = self.relu(self.conv3(x))
         x5 = self.relu(self.conv5(x))
-        # 融合多尺度特征
         out = self.fuse(torch.cat([x3, x5], dim=1))
         return self.relu(self.bn(out))
 
@@ -104,72 +87,67 @@ class OutConv(nn.Module):
         return self.conv(x)
 
 
-class ConDSeg(nn.Module):
+class ConDSegPretrained(nn.Module):
     """
-    基于 ConDSeg (AAAI 2025) 的网络架构变体
-    不包含原论文的两阶段对比预训练，仅保留 Encoder-SAD_Decoder 结构
+    搭载 ImageNet 预训练 ResNet34 的 ConDSeg
     """
 
     def __init__(self, n_channels=3, n_classes=1):
-        super(ConDSeg, self).__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
+        super(ConDSegPretrained, self).__init__()
 
-        # 编码器 (Encoder)
-        self.inc = DoubleConv(n_channels, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512)
-        self.down4 = Down(512, 1024)
+        # 1. 加载官方 ResNet34 预训练权重
+        resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
 
-        # 尺寸感知解码器 (Size-Aware Decoder)
-        self.up1 = SADUp(1024 + 512, 512)
-        self.up2 = SADUp(512 + 256, 256)
-        self.up3 = SADUp(256 + 128, 128)
-        self.up4 = SADUp(128 + 64, 64)
+        # 2. 剥离并重组预训练编码器 (Encoder)
+        self.firstconv = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)  # 输出通道: 64
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1  # 输出通道: 64
+        self.layer2 = resnet.layer2  # 输出通道: 128
+        self.layer3 = resnet.layer3  # 输出通道: 256
+        self.layer4 = resnet.layer4  # 输出通道: 512
 
-        self.outc = OutConv(64, n_classes)
+        # 3. 尺寸感知解码器 (Size-Aware Decoder) 调整通道配置
+        # 上采样输入通道 = 上一层输出 + 当前层跳跃连接
+        self.up1 = SADUp(512 + 256, 256)
+        self.up2 = SADUp(256 + 128, 128)
+        self.up3 = SADUp(128 + 64, 64)
+        self.up4 = SADUp(64 + 64, 64)
+
+        # 补充最后一次上采样，以弥补 ResNet 初始步长造成的尺寸折半
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+
+        self.outc = OutConv(32, n_classes)
 
     def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
+        # --- Encoder ---
+        x1 = self.firstconv(x)  # (B, 64, H/2, W/2)
+        x_pool = self.maxpool(x1)  # (B, 64, H/4, W/4)
 
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
+        x2 = self.layer1(x_pool)  # (B, 64, H/4, W/4)
+        x3 = self.layer2(x2)  # (B, 128, H/8, W/8)
+        x4 = self.layer3(x3)  # (B, 256, H/16, W/16)
+        x5 = self.layer4(x4)  # (B, 512, H/32, W/32)
 
-        logits = self.outc(x)
+        # --- Decoder ---
+        d1 = self.up1(x5, x4)  # (B, 256, H/16, W/16)
+        d2 = self.up2(d1, x3)  # (B, 128, H/8, W/8)
+        d3 = self.up3(d2, x2)  # (B, 64, H/4, W/4)
+        d4 = self.up4(d3, x1)  # (B, 64, H/2, W/2)
+
+        d5 = self.final_up(d4)  # (B, 32, H, W)
+        logits = self.outc(d5)  # (B, 1, H, W)
+
         return torch.sigmoid(logits)
 
 
 # ==========================================
-# 2. 混合损失函数与指标计算 (保留原版)
+# 2. 指标计算与其他基础设施 (保留不变)
 # ==========================================
-class HybridLoss(nn.Module):
-    def __init__(self, weight_bce=0.4, weight_jaccard=0.6):
-        super(HybridLoss, self).__init__()
-        self.bce = nn.BCELoss()
-        self.weight_bce = weight_bce
-        self.weight_jaccard = weight_jaccard
-
-    def forward(self, pred, target):
-        bce_loss = self.bce(pred, target)
-        smooth = 1e-5
-
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
-
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - intersection
-
-        jaccard_loss = 1.0 - (intersection + smooth) / (union + smooth)
-
-        return (self.weight_bce * bce_loss) + (self.weight_jaccard * jaccard_loss.mean())
-
 
 def calculate_metrics(pred, target, smooth=1e-5):
     pred_bin = (pred > 0.5).float()
@@ -188,9 +166,6 @@ def calculate_metrics(pred, target, smooth=1e-5):
     return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
 
 
-# ==========================================
-# 3. 数据集与增强加载 (保留原版)
-# ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
         self.image_paths = image_paths
@@ -235,11 +210,11 @@ def get_dataset_paths(data_dir):
 
 
 # ==========================================
-# 4. 主控台
+# 3. 主控台
 # ==========================================
 def main():
     MODE = "train"  # 可选: "train" 或 "test"
-    save_path = "best_busi.pth"  # 更新权重保存名称
+    save_path = "best_busi_condseg_pretrained.pth"  # 更新权重保存名称
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -274,13 +249,14 @@ def main():
     print(f"✅ 数据加载完毕 | Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
 
     # ==========================================
-    # 3. 替换为 AAAI 2025 ConDSeg 基线网络
+    # 替换为具备预训练权重的网络
     # ==========================================
-    model = ConDSeg(n_channels=3, n_classes=1).to(device)
+    model = ConDSegPretrained(n_channels=3, n_classes=1).to(device)
     criterion = HybridLoss()
 
     if MODE == "train":
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+        # 预训练网络可以适当调小学习率，加速收敛且防止预训练特征崩溃
+        optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
         num_epochs = 35
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
@@ -292,7 +268,7 @@ def main():
         ax1.set_xlabel('Epochs')
         ax1.set_ylabel('Train Loss', color='tab:red')
         ax2.set_ylabel('Validation Dice', color='tab:blue')
-        plt.title('Baseline Training Progress (ConDSeg-AAAI2025)')
+        plt.title('Training Progress (ConDSeg Pretrained)')
         line_loss, = ax1.plot([], [], color='tab:red', marker='o', label='Train Loss')
         line_dice, = ax2.plot([], [], color='tab:blue', marker='s', label='Val Dice')
         ax1.legend([line_loss, line_dice], ['Train Loss', 'Val Dice'], loc='center right')
@@ -351,12 +327,12 @@ def main():
             gc.collect()
 
         plt.ioff()
-        plt.savefig('baseline_training_curve_condseg.png', dpi=150)
-        print("📈 基线训练曲线已保存为 baseline_training_curve_condseg.png")
+        plt.savefig('baseline_training_curve_condseg_pretrained.png', dpi=150)
+        print("📈 基线训练曲线已保存为 baseline_training_curve_condseg_pretrained.png")
 
     if MODE in ["train", "test"]:
         print("\n" + "=" * 50)
-        print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 Baseline (ConDSeg) 最终性能...")
+        print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 Baseline 最终性能...")
 
         if not os.path.exists(save_path):
             print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
@@ -400,7 +376,7 @@ def main():
             avg_time_per_image = (total_infer_time / total_samples) * 1000
             fps = 1.0 / (total_infer_time / total_samples)
 
-            print("\n🏆  ConDSeg (BUSI dataset) 最终测试集成绩 🏆")
+            print("\n🏆  ConDSeg Pretrained (BUSI dataset) 最终测试集成绩 🏆")
             print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
             print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
             print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")

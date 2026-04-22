@@ -16,7 +16,6 @@ from tqdm import tqdm
 from CONDSeg.main import  ConDSeg
 from transunet.main import HybridLoss
 
-from unet.main import UNet
 from unet.main import calculate_metrics
 
 # ==========================================
