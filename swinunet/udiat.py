@@ -7,19 +7,103 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
-from swinunet.main import HybridLoss
-
-from swinunet.main import SwinUNet_Hybrid
-from swinunet.main import calculate_metrics
+import argparse
+import gc
 
 # ==========================================
-# 6. UDIAT 数据集加载 (原图/GT结构)
+# 1. 导入官方的 config 和 Swin-Unet 模型
+# ==========================================
+from config import get_config
+from networks.vision_transformer import SwinUnet as ViT_seg
+
+
+# ==========================================
+# 2. 官方 Swin-Unet 的包装器
+# ==========================================
+class OfficialSwinUNetWrapper(nn.Module):
+    def __init__(self, img_size=224, num_classes=1, cfg_path='configs/swin_tiny_patch4_window7_224_lite.yaml'):
+        super(OfficialSwinUNetWrapper, self).__init__()
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--cfg', type=str, default=cfg_path, help='path to config file')
+        parser.add_argument("--opts", help="Modify config options", default=None, nargs='+')
+        parser.add_argument('--batch_size', type=int, default=8, help='batch_size per gpu')
+        parser.add_argument('--zip', action='store_true')
+        parser.add_argument('--cache-mode', type=str, default='part')
+        parser.add_argument('--resume', help='resume from checkpoint')
+        parser.add_argument('--accumulation-steps', type=int)
+        parser.add_argument('--use-checkpoint', action='store_true')
+        parser.add_argument('--amp-opt-level', type=str, default='O1')
+        parser.add_argument('--tag', help='tag of experiment')
+        parser.add_argument('--eval', action='store_true')
+        parser.add_argument('--throughput', action='store_true')
+        args = parser.parse_args(args=[])
+
+        config = get_config(args)
+        self.model = ViT_seg(config, img_size=img_size, num_classes=num_classes)
+
+        # 加载 yaml 中配置的 swin transformer 初始预训练权重 (ImageNet)
+        if os.path.exists(config.MODEL.PRETRAIN_CKPT):
+            self.model.load_from(config)
+
+    def forward(self, x):
+        logits = self.model(x)
+        return torch.sigmoid(logits)
+
+
+# ==========================================
+# 3. 官方损失函数与指标计算
+# ==========================================
+class OfficialDiceLoss(nn.Module):
+    def __init__(self):
+        super(OfficialDiceLoss, self).__init__()
+
+    def forward(self, score, target):
+        target = target.float()
+        smooth = 1e-5
+        intersect = torch.sum(score * target)
+        y_sum = torch.sum(target * target)
+        z_sum = torch.sum(score * score)
+        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+        return 1.0 - loss
+
+
+class OfficialHybridLoss(nn.Module):
+    def __init__(self, weight_bce=0.4, weight_dice=0.6):
+        super(OfficialHybridLoss, self).__init__()
+        self.bce = nn.BCELoss()
+        self.dice = OfficialDiceLoss()
+        self.weight_bce = weight_bce
+        self.weight_dice = weight_dice
+
+    def forward(self, pred, target):
+        bce_loss = self.bce(pred, target)
+        dice_loss = self.dice(pred, target)
+        return (self.weight_bce * bce_loss) + (self.weight_dice * dice_loss)
+
+
+def calculate_metrics(pred, target, smooth=1e-5):
+    pred_bin = (pred > 0.5).float()
+    target_bin = target.float()
+    pred_flat = pred_bin.view(pred_bin.size(0), -1)
+    target_flat = target_bin.view(target_bin.size(0), -1)
+    tp = (pred_flat * target_flat).sum(dim=1)
+    fp = (pred_flat * (1 - target_flat)).sum(dim=1)
+    fn = ((1 - pred_flat) * target_flat).sum(dim=1)
+    tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
+    dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
+    iou = (tp + smooth) / (tp + fp + fn + smooth)
+    acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
+    pre = (tp + smooth) / (tp + fp + smooth)
+    rec = (tp + smooth) / (tp + fn + smooth)
+    return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
+
+
+# ==========================================
+# 4. UDIAT 数据集加载
 # ==========================================
 class UDIATDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -32,20 +116,18 @@ class UDIATDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        image = TF.resize(image, (256, 256))
-        mask = TF.resize(mask, (256, 256))
+        # 🌟 修复点：修改为 224x224 以适配官方 Swin-Unet
+        image = TF.resize(image, (224, 224))
+        mask = TF.resize(mask, (224, 224))
 
         if self.is_train:
-            # 1. 随机水平翻转
             if random.random() > 0.5:
                 image = TF.hflip(image)
                 mask = TF.hflip(mask)
-            # 2. 随机旋转
             angle = random.uniform(-15, 15)
             image = TF.rotate(image, angle)
             mask = TF.rotate(mask, angle)
 
-            # 3. 增加一点尺度缩放和平移 (超声图像中病灶大小差异很大)
             if random.random() > 0.5:
                 scale = random.uniform(0.9, 1.1)
                 translate = [int(random.uniform(-10, 10)), int(random.uniform(-10, 10))]
@@ -55,7 +137,7 @@ class UDIATDataset(Dataset):
         image = TF.to_tensor(image)
         mask = TF.to_tensor(mask)
 
-        # 【关键修复】加上 ImageNet Normalization
+        # ImageNet Normalization
         image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         return image, mask
@@ -75,7 +157,6 @@ def get_udiat_paths(data_dir):
                 img_p.append(img_path)
                 mask_p.append(mask_path)
             else:
-                # 兼容大小写差异（如 .PNG 和 .png）
                 alt_f = f.replace('.PNG', '.png') if '.PNG' in f else f.replace('.png', '.PNG')
                 alt_mask_path = os.path.join(gt_dir, alt_f)
                 if os.path.exists(alt_mask_path):
@@ -87,16 +168,14 @@ def get_udiat_paths(data_dir):
 
 
 # ==========================================
-# 7. 主控台
+# 5. 主控台
 # ==========================================
 def main():
-    # 🌟🌟🌟 控制面板 🌟🌟🌟
-    MODE = "train"  # "train" 训练(微调) | "test" 直接评估
-    data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
+    MODE = "train"
+    data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"
 
-    # 🚀 修改 1：定义预训练权重和新权重的路径
     pretrained_busi_path = "best_busi.pth"
-    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
+    save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
@@ -112,30 +191,32 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = SwinUNet_Hybrid().to(device)
+    # 实例化官方包裹器
+    model = OfficialSwinUNetWrapper(img_size=224, num_classes=1).to(device)
 
     if MODE == "train":
-        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        # 加载 BUSI 上的预训练权重
         if os.path.exists(pretrained_busi_path):
             print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
             print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
         else:
-            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！")
+            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将仅基于 ImageNet 预训练权重开始训练！")
 
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
         val_loader = DataLoader(
             UDIATDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False), batch_size=8,
             shuffle=False)
 
-        criterion = HybridLoss()
+        criterion = OfficialHybridLoss()
 
-        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
-        fine_tune_lr = 1e-4
-        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+        # SGD 优化器，设定微调学习率为 1e-3
+        fine_tune_lr = 1e-3
+        optimizer = optim.SGD(model.parameters(), lr=fine_tune_lr, momentum=0.9, weight_decay=1e-4)
 
         num_epochs = 50
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+        max_iterations = num_epochs * len(train_loader)
+        iter_num = 0
 
         best_val_dice = 0.0
         history_loss, history_val_dice = [], []
@@ -153,8 +234,15 @@ def main():
 
                 loss.backward()
                 optimizer.step()
+
+                # 按照官方源码 trainer.py 中的 Poly Decay 更新学习率
+                lr_ = fine_tune_lr * (1.0 - iter_num / max_iterations) ** 0.9
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_
+                iter_num += 1
+
                 train_loss_epoch += loss.item()
-                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
+                pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{lr_:.6f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
 
@@ -164,44 +252,42 @@ def main():
             with torch.no_grad():
                 for images, masks in val_loader:
                     out = model(images.to(device))
-                    # 适配你的输出元组形式或单输出形式
-                    if isinstance(out, tuple): out = out[0]
                     val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
             avg_val_dice = np.mean(val_dices)
-            scheduler.step()
             history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
 
             print(
-                f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+                f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | End LR: {lr_:.6f}")
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                # 🚀 修改 4：保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
+            torch.cuda.empty_cache()
+            gc.collect()
+
         # 训练结束后静态绘制曲线图
         plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1);
-        plt.plot(history_loss, marker='o');
-        plt.title("Train Loss");
+        plt.subplot(1, 2, 1)
+        plt.plot(history_loss, marker='o')
+        plt.title("Train Loss")
         plt.grid()
-        plt.subplot(1, 2, 2);
-        plt.plot(history_val_dice, marker='s', color='orange');
-        plt.title("Val Dice");
+        plt.subplot(1, 2, 2)
+        plt.plot(history_val_dice, marker='s', color='orange')
+        plt.title("Val Dice")
         plt.grid()
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
+        plt.savefig('training_curve_OfficialSwin_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_OfficialSwin_UDIAT_Finetuned.png")
 
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的测试集上评估...")
     test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
                              batch_size=1, shuffle=False)
 
-    # 测试阶段：加载微调后保存的最新权重
     if not os.path.exists(save_path):
         print(f"❌ 找不到权重文件 {save_path}！请先运行 train 模式。")
         return
@@ -211,7 +297,8 @@ def main():
 
     print("🔥 GPU 预热 (Warm-up)...")
     with torch.no_grad():
-        for _ in range(5): model(torch.randn(1, 3, 256, 256).to(device))
+        # 🌟 修复点：测试集评估时预热的 dummy input 尺寸也需要对齐到 224x224
+        for _ in range(5): model(torch.randn(1, 3, 224, 224).to(device))
     if torch.cuda.is_available(): torch.cuda.synchronize()
 
     test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
@@ -229,11 +316,10 @@ def main():
             total_time += (time.time() - t0)
             total_samples += images.size(0)
 
-            if isinstance(outputs, tuple): outputs = outputs[0]
             m = calculate_metrics(outputs, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 swinunet (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print("\n🏆 Official Swin-Unet (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
@@ -242,6 +328,7 @@ def main():
     print(
         f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

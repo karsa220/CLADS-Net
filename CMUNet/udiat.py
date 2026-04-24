@@ -7,19 +7,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from CMUNet.main import HybridLoss
+# ==========================================
+# 1. 替换模型导入为 CMU-Net
+# ==========================================
+from src.network.CMUNet import CMUNet
+from src.losses import BCEDiceLoss
 
-from CMUNet.main import CMUNet
-from CMUNet.main import calculate_metrics
 
 # ==========================================
-# 6. UDIAT 数据集加载 (原图/GT结构)
+# 2. 指标计算函数
+# ==========================================
+def calculate_metrics(pred, target, smooth=1e-5):
+    pred_bin = (pred > 0.5).float()
+    target_bin = target.float()
+    pred_flat = pred_bin.view(pred_bin.size(0), -1)
+    target_flat = target_bin.view(target_bin.size(0), -1)
+    tp = (pred_flat * target_flat).sum(dim=1)
+    fp = (pred_flat * (1 - target_flat)).sum(dim=1)
+    fn = ((1 - pred_flat) * target_flat).sum(dim=1)
+    tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
+    dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
+    iou = (tp + smooth) / (tp + fp + fn + smooth)
+    acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
+    pre = (tp + smooth) / (tp + fp + smooth)
+    rec = (tp + smooth) / (tp + fn + smooth)
+    return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
+
+
+# ==========================================
+# 3. UDIAT 数据集加载 (原图/GT结构)
 # ==========================================
 class UDIATDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -55,7 +76,7 @@ class UDIATDataset(Dataset):
         image = TF.to_tensor(image)
         mask = TF.to_tensor(mask)
 
-        # 【关键修复】加上 ImageNet Normalization
+        # ImageNet Normalization
         image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         return image, mask
@@ -87,16 +108,16 @@ def get_udiat_paths(data_dir):
 
 
 # ==========================================
-# 7. 主控台
+# 4. 主控台
 # ==========================================
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
     MODE = "train"  # "train" 训练(微调) | "test" 直接评估
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
-    # 🚀 修改 1：定义预训练权重和新权重的路径
+    # 🚀 修改 1：对应上一份脚本在 BUSI 上的最佳权重名
     pretrained_busi_path = "best_busi.pth"
-    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
+    save_path = "best_CMUNet_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
@@ -112,27 +133,29 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = CMUNet().to(device)
+    # 🚀 修改 2：初始化 CMU-Net 模型
+    print("🔥 初始化 CMU-Net 模型...")
+    model = CMUNet(img_ch=3, output_ch=1, l=7, k=7).to(device)
 
     if MODE == "train":
-        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        # 🚀 修改 3：加载 BUSI 上的最佳 CMU-Net 权重进行微调
         if os.path.exists(pretrained_busi_path):
             print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
             print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
         else:
-            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！")
+            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头初始化！")
 
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
         val_loader = DataLoader(
             UDIATDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False), batch_size=8,
             shuffle=False)
 
-        criterion = HybridLoss()
+        criterion = BCEDiceLoss().to(device)
 
-        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
+        # 优化器改用 AdamW，学习率使用 1e-4 进行微调
         fine_tune_lr = 1e-4
-        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+        optimizer = optim.AdamW(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
 
         num_epochs = 50
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -148,6 +171,8 @@ def main():
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
+
+                # 🚀 修改 4：CMU-Net 只有一个最终输出，且 Loss 内部会自动做 Sigmoid
                 outputs = model(images)
                 loss = criterion(outputs, masks)
 
@@ -163,10 +188,12 @@ def main():
             val_dices = []
             with torch.no_grad():
                 for images, masks in val_loader:
-                    out = model(images.to(device))
-                    # 适配你的输出元组形式或单输出形式
-                    if isinstance(out, tuple): out = out[0]
-                    val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
+                    images, masks = images.to(device), masks.to(device)
+                    out = model(images)
+
+                    # 🚀 修改 5：验证时将网络输出过 Sigmoid 以转换为概率
+                    pred = torch.sigmoid(out)
+                    val_dices.extend(calculate_metrics(pred, masks)["dice"])
 
             avg_val_dice = np.mean(val_dices)
             scheduler.step()
@@ -178,7 +205,6 @@ def main():
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                # 🚀 修改 4：保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
@@ -193,8 +219,8 @@ def main():
         plt.title("Val Dice");
         plt.grid()
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
+        plt.savefig('training_curve_CMUNet_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_CMUNet_UDIAT_Finetuned.png")
 
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的测试集上评估...")
@@ -229,11 +255,13 @@ def main():
             total_time += (time.time() - t0)
             total_samples += images.size(0)
 
-            if isinstance(outputs, tuple): outputs = outputs[0]
-            m = calculate_metrics(outputs, masks)
+            # 🚀 修改 6：测试推理同样提取单一输出并套一层 Sigmoid
+            pred = torch.sigmoid(outputs)
+            m = calculate_metrics(pred, masks)
+
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 CMUnet (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print("\n🏆 CMU-Net (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
@@ -242,6 +270,7 @@ def main():
     print(
         f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

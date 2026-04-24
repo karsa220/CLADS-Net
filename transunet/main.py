@@ -1,159 +1,38 @@
 import os
 import random
 import time
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import gc
 
-
 # ==========================================
-# 1. 基础卷积块 (Decoder 使用)
+# 导入官方 TransUNet 依赖
 # ==========================================
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super(DoubleConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        return self.conv(x)
+from networks.vit_seg_modeling import VisionTransformer as ViT_seg
+from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
+from utils import DiceLoss
 
 
 # ==========================================
-# 2. 网络主体：TransUNet (对比基线模型)
+# 1. 评估指标计算 (适配官方多通道输出)
 # ==========================================
-class TransUNet(nn.Module):
-    def __init__(self, img_dim=256, in_channels=3, out_channels=1, embed_dim=768, depth=8, num_heads=8):
-        super(TransUNet, self).__init__()
+def calculate_metrics(pred_bin, target, smooth=1e-5):
+    # pred_bin 和 target 的 shape 均为 (B, H, W)
+    pred_flat = pred_bin.view(pred_bin.size(0), -1).float()
+    target_flat = target.view(target.size(0), -1).float()
 
-        # 1. CNN Encoder (提取到 ResNet50 的 layer3)
-        self.resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-
-        # 2. Patch Embedding (用 1x1 卷积将 ResNet 输出的通道数降维到 Transformer 的特征维度)
-        self.patch_proj = nn.Conv2d(1024, embed_dim, kernel_size=1)
-
-        # 3. Transformer Encoder (ViT Bottleneck)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim * 4,
-            activation='gelu',
-            batch_first=True,
-            dropout=0.1
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-
-        # 位置编码 (假设输入 256x256，经过 resnet layer3 后分辨率为 16x16)
-        num_patches = (img_dim // 16) ** 2
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-
-        # 4. Decoder 模块
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec4 = DoubleConv(embed_dim + 512, 512)  # Trans特征(768) + layer2跳跃(512)
-
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec3 = DoubleConv(512 + 256, 256)  # 上采样特征(512) + layer1跳跃(256)
-
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec2 = DoubleConv(256 + 64, 128)  # 上采样特征(256) + conv1跳跃(64)
-
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec1 = DoubleConv(128, 64)  # 恢复到原图分辨率 256x256
-
-        self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # --- Encoder ---
-        x0 = self.resnet.conv1(x)
-        x0 = self.resnet.bn1(x0)
-        x0 = self.resnet.relu(x0)  # (B, 64, 128, 128)
-        skip1 = x0
-
-        x1 = self.resnet.maxpool(x0)
-        x1 = self.resnet.layer1(x1)  # (B, 256, 64, 64)
-        skip2 = x1
-
-        x2 = self.resnet.layer2(x1)  # (B, 512, 32, 32)
-        skip3 = x2
-
-        x3 = self.resnet.layer3(x2)  # (B, 1024, 16, 16) - 进入 Transformer
-
-        # --- ViT Bottleneck ---
-        B, C, H, W = x3.shape
-        x_proj = self.patch_proj(x3)  # (B, 768, 16, 16)
-        x_flat = x_proj.flatten(2).transpose(1, 2)  # (B, 256, 768)
-
-        x_flat = x_flat + self.pos_embed  # 加入位置编码
-        x_trans = self.transformer(x_flat)  # (B, 256, 768)
-
-        x_trans = x_trans.transpose(1, 2).reshape(B, -1, H, W)  # 恢复为 (B, 768, 16, 16)
-
-        # --- Decoder ---
-        up4 = self.up4(x_trans)
-        d4 = self.dec4(torch.cat([up4, skip3], dim=1))  # 输出: (B, 512, 32, 32)
-
-        up3 = self.up3(d4)
-        d3 = self.dec3(torch.cat([up3, skip2], dim=1))  # 输出: (B, 256, 64, 64)
-
-        up2 = self.up2(d3)
-        d2 = self.dec2(torch.cat([up2, skip1], dim=1))  # 输出: (B, 128, 128, 128)
-
-        up1 = self.up1(d2)
-        d1 = self.dec1(up1)  # 输出: (B, 64, 256, 256)
-
-        out = torch.sigmoid(self.final_conv(d1))
-        return out
-
-
-# ==========================================
-# 3. 混合损失函数与指标计算 (完全保留)
-# ==========================================
-class HybridLoss(nn.Module):
-    def __init__(self, weight_bce=0.4, weight_jaccard=0.6):
-        super(HybridLoss, self).__init__()
-        self.bce = nn.BCELoss()
-        self.weight_bce = weight_bce
-        self.weight_jaccard = weight_jaccard
-
-    def forward(self, pred, target):
-        bce_loss = self.bce(pred, target)
-        smooth = 1e-5
-
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
-
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - intersection
-
-        jaccard_loss = 1.0 - (intersection + smooth) / (union + smooth)
-
-        return (self.weight_bce * bce_loss) + (self.weight_jaccard * jaccard_loss.mean())
-
-
-def calculate_metrics(pred, target, smooth=1e-5):
-    pred_bin = (pred > 0.5).float()
-    target_bin = target.float()
-    pred_flat = pred_bin.view(pred_bin.size(0), -1)
-    target_flat = target_bin.view(target_bin.size(0), -1)
     tp = (pred_flat * target_flat).sum(dim=1)
     fp = (pred_flat * (1 - target_flat)).sum(dim=1)
     fn = ((1 - pred_flat) * target_flat).sum(dim=1)
     tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
+
     dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
     iou = (tp + smooth) / (tp + fp + fn + smooth)
     acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
@@ -163,7 +42,7 @@ def calculate_metrics(pred, target, smooth=1e-5):
 
 
 # ==========================================
-# 4. 数据集与增强加载 (完全保留)
+# 2. 数据集加载 (调整 Mask 输出格式以适配官方 Loss)
 # ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -189,7 +68,11 @@ class BUSIDataset(Dataset):
             image = TF.rotate(image, angle)
             mask = TF.rotate(mask, angle)
 
-        return TF.to_tensor(image), TF.to_tensor(mask)
+        # Mask 转换为 (256, 256) 的 LongTensor 类别索引 (0 为背景，1 为目标)
+        mask_tensor = TF.to_tensor(mask)
+        mask_tensor = torch.where(mask_tensor > 0.5, 1, 0).squeeze(0).long()
+
+        return TF.to_tensor(image), mask_tensor
 
 
 def get_dataset_paths(data_dir):
@@ -209,29 +92,21 @@ def get_dataset_paths(data_dir):
 
 
 # ==========================================
-# 5. 主控台
+# 3. 主控台
 # ==========================================
 def main():
-
-    # ==========================================
-    # 1. 运行模式设置
-    # ==========================================
-    MODE = "train"  # 可选: "train" 或 "test"
-    save_path = "best_busi.pth"
-
+    MODE = "train"
+    save_path = "best_busi_official.pth"
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
 
-    # ==========================================
-    # 2. 数据集加载与划分
-    # ==========================================
+    # --- 数据集加载与划分 ---
     all_imgs, all_masks = get_dataset_paths(data_dir)
     total_size = len(all_imgs)
     if total_size == 0:
         print("❌ 未找到数据！请检查路径。")
-        # 如果在函数外直接 return 会报错，建议用 sys.exit() 或放在 main() 中
-        exit()
+        return
 
     combined = list(zip(all_imgs, all_masks))
     random.seed(42)
@@ -249,36 +124,52 @@ def main():
     val_dataset = BUSIDataset(val_imgs, val_masks, is_train=False)
     test_dataset = BUSIDataset(test_imgs, test_masks, is_train=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
-
-    print(f"✅ 数据加载完毕 | Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
-
-    # ==========================================
-    # 3. 模型与损失函数初始化
-    # ==========================================
-    model = TransUNet().to(device)
-    criterion = HybridLoss()
+    batch_size = 8
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # ==========================================
-    # 4. 训练模式 (Train)
+    # 官方模型初始化
+    # ==========================================
+    config_vit = CONFIGS_ViT_seg['R50-ViT-B_16']  # 使用官方 R50+ViT-B_16 配置
+    config_vit.n_classes = 2  # 背景(0) + 肿块(1)
+    config_vit.n_skip = 3
+    config_vit.patches.grid = (int(256 / 16), int(256 / 16))  # 适配 256x256 输入
+
+    model = ViT_seg(config_vit, img_size=256, num_classes=2).to(device)
+
+    # 【可选】加载官方 ImageNet21k 预训练权重
+    # 如果你下载了预训练权重，请取消注释下面两行并修改路径：
+    # pretrained_path = './model/vit_checkpoint/imagenet21k/R50+ViT-B_16.npz'
+    # model.load_from(weights=np.load(pretrained_path))
+
+    # ==========================================
+    # 官方损失函数
+    # ==========================================
+    ce_loss = nn.CrossEntropyLoss()
+    dice_loss_func = DiceLoss(2)
+
+    # ==========================================
+    # 训练模式
     # ==========================================
     if MODE == "train":
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 35
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+        # 官方优化器设置：SGD, lr=0.01, momentum=0.9, weight_decay=1e-4
+        base_lr = 0.01
+        optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
+        num_epochs = 35
+        max_iterations = num_epochs * len(train_loader)
+        iter_num = 0
         best_val_dice = 0.0
 
-        # 初始化绘图
         plt.ion()
         fig, ax1 = plt.subplots(figsize=(10, 6))
         ax2 = ax1.twinx()
         ax1.set_xlabel('Epochs')
         ax1.set_ylabel('Train Loss', color='tab:red')
         ax2.set_ylabel('Validation Dice', color='tab:blue')
-        plt.title('Baseline Training Progress (TransUNet)')
+        plt.title('Official TransUNet Training Progress')
         line_loss, = ax1.plot([], [], color='tab:red', marker='o', label='Train Loss')
         line_dice, = ax2.plot([], [], color='tab:blue', marker='s', label='Val Dice')
         ax1.legend([line_loss, line_dice], ['Train Loss', 'Val Dice'], loc='center right')
@@ -292,35 +183,49 @@ def main():
             for images, masks in pbar_train:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
-                outputs = model(images)
-                loss = criterion(outputs, masks)
+
+                outputs = model(images)  # 官方模型输出形状: (B, 2, H, W)
+
+                # 官方 Loss 组合：0.5 CE + 0.5 Dice
+                loss_ce = ce_loss(outputs, masks)
+                loss_dice = dice_loss_func(outputs, masks, softmax=True)
+                loss = 0.5 * loss_ce + 0.5 * loss_dice
+
                 loss.backward()
                 optimizer.step()
 
+                # 官方 Poly 学习率衰减策略
+                lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_
+                iter_num += 1
+
                 train_loss_epoch += loss.item()
-                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}"})
+                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{lr_:.6f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
 
+            # --- 验证阶段 ---
             model.eval()
             val_dices = []
             with torch.no_grad():
                 for images, masks in val_loader:
                     images, masks = images.to(device), masks.to(device)
                     outputs = model(images)
-                    val_dices.extend(calculate_metrics(outputs, masks)["dice"])
+
+                    # 将模型输出的 logits 转为预测类别
+                    preds = torch.argmax(torch.softmax(outputs, dim=1), dim=1)
+                    val_dices.extend(calculate_metrics(preds, masks)["dice"])
 
             avg_val_dice = np.mean(val_dices)
-            scheduler.step()
 
             print(
-                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {lr_:.6f}")
 
-            # 更新绘图数据
+            # 绘图更新
             epochs_list.append(epoch + 1)
             history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
-
             line_loss.set_data(epochs_list, history_loss)
             line_dice.set_data(epochs_list, history_val_dice)
             ax1.set_xlim(1, max(2, epoch + 1))
@@ -329,40 +234,35 @@ def main():
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-            # 保存最佳模型
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
                 torch.save(model.state_dict(), save_path)
-                print(f"🌟 [New Best Baseline Saved] Val Dice: {best_val_dice:.4f}")
+                print(f"🌟 [New Best Model Saved] Val Dice: {best_val_dice:.4f}")
 
             torch.cuda.empty_cache()
             gc.collect()
 
-        # 结束绘图
         plt.ioff()
-        plt.savefig('baseline_training_curve.png', dpi=150)
-        print("📈 基线训练曲线已保存为 baseline_training_curve.png")
+        plt.savefig('official_transunet_curve.png', dpi=150)
+        print("📈 官方配置训练曲线已保存为 official_transunet_curve.png")
+
     # ==========================================
-    # 5. 测试模式 (Test) / 全指标评估
+    # 测试模式
     # ==========================================
     if MODE in ["train", "test"]:
         print("\n" + "=" * 50)
-        print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 Baseline 最终性能...")
+        print("🚀 开始在测试集评估 Official TransUNet ...")
 
         if not os.path.exists(save_path):
-            print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
+            print(f"❌ 找不到权重文件: {save_path}")
         else:
             model.load_state_dict(torch.load(save_path, map_location=device))
             model.eval()
 
             test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
-            print("🔥 正在进行 GPU 预热 (Warm-up)...")
             dummy_input = torch.randn(1, 3, 256, 256).to(device)
             with torch.no_grad():
-                for _ in range(10):
-                    _ = model(dummy_input)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                for _ in range(10): _ = model(dummy_input)
 
             total_infer_time = 0.0
             total_samples = 0
@@ -371,36 +271,34 @@ def main():
                 for images, masks in tqdm(test_loader, desc="Testing"):
                     images, masks = images.to(device), masks.to(device)
 
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                    if torch.cuda.is_available(): torch.cuda.synchronize()
                     start_time = time.time()
 
                     outputs = model(images)
+                    preds = torch.argmax(torch.softmax(outputs, dim=1), dim=1)  # 提取预测类别
 
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                    if torch.cuda.is_available(): torch.cuda.synchronize()
                     end_time = time.time()
 
                     total_infer_time += (end_time - start_time)
                     total_samples += images.size(0)
 
-                    metrics = calculate_metrics(outputs, masks)
+                    metrics = calculate_metrics(preds, masks)
                     for k in test_res.keys():
                         test_res[k].extend(metrics[k])
 
             avg_time_per_image = (total_infer_time / total_samples) * 1000
             fps = 1.0 / (total_infer_time / total_samples)
-            print("\n🏆 transunet (BUSI dataset)  最终测试集成绩 🏆")
+            print("\n🏆 Official TransUNet (BUSI dataset) 最终成绩 🏆")
             print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
             print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
             print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
             print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
             print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
             print("-" * 50)
-            print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
-            print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

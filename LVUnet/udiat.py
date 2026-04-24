@@ -1,6 +1,7 @@
 import os
 import random
 import time
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,10 +14,14 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from nnUnet.main import HybridLoss
+from main import HybridLoss
+from main import calculate_metrics
 
-from nnUnet.main import nnUNet_2D
-from nnUnet.main import calculate_metrics
+# ==========================================
+# 导入 LV-UNet
+# ==========================================
+from LV_UNet import LV_UNet
+
 
 # ==========================================
 # 6. UDIAT 数据集加载 (原图/GT结构)
@@ -92,14 +97,15 @@ def get_udiat_paths(data_dir):
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
     MODE = "train"  # "train" 训练(微调) | "test" 直接评估
+    DEEP_TRAINING = True  # 开启 LV-UNet 的深度训练特性
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
-    # 🚀 修改 1：定义预训练权重和新权重的路径
-    pretrained_busi_path = "best_busi.pth"
-    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
+    # 🚀 修改 1：对应上一份代码，读取 LV-UNet 在 BUSI 上的预训练权重
+    pretrained_busi_path = "best_busi_lvunet.pth"
+    save_path = "best_UDIAT_finetuned_lvunet.pth"  # 微调后保存的新权重名
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
+    print(f"🚀 Device: {device} | ⚙️ Mode: {MODE} | Deep Training: {DEEP_TRAINING}")
 
     all_imgs, all_masks = get_udiat_paths(data_dir)
     if not all_imgs: return
@@ -112,10 +118,10 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = nnUNet_2D().to(device)
+    # 🚀 修改 2：初始化 LV_UNet
+    model = LV_UNet().to(device)
 
     if MODE == "train":
-        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
         if os.path.exists(pretrained_busi_path):
             print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
@@ -130,7 +136,6 @@ def main():
 
         criterion = HybridLoss()
 
-        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
         fine_tune_lr = 1e-4
         optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
 
@@ -143,12 +148,23 @@ def main():
         for epoch in range(num_epochs):
             model.train()
             train_loss_epoch = 0.0
+
+            # LV-UNet 特性: 动态深度训练 (基于 Cosine 函数调节激活参数)
+            if DEEP_TRAINING:
+                act_learn = 1 - math.cos(math.pi / 2 * epoch / num_epochs)
+                try:
+                    model.change_act(act_learn)
+                except AttributeError:
+                    pass
+
             pbar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{num_epochs}]", leave=False)
 
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
-                outputs = model(images)
+
+                # 🚀 修改 3：LV_UNet 输出的是 logits，经过 sigmoid 转换为概率
+                outputs = torch.sigmoid(model(images))
                 loss = criterion(outputs, masks)
 
                 loss.backward()
@@ -163,9 +179,7 @@ def main():
             val_dices = []
             with torch.no_grad():
                 for images, masks in val_loader:
-                    out = model(images.to(device))
-                    # 适配你的输出元组形式或单输出形式
-                    if isinstance(out, tuple): out = out[0]
+                    out = torch.sigmoid(model(images.to(device)))
                     val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
             avg_val_dice = np.mean(val_dices)
@@ -178,7 +192,7 @@ def main():
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                # 🚀 修改 4：保存微调后的最佳模型
+                # 🚀 修改 4：保存微调后的 LV_UNet 最佳模型
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
@@ -193,8 +207,8 @@ def main():
         plt.title("Val Dice");
         plt.grid()
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
+        plt.savefig('training_curve_LVUNet_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_LVUNet_UDIAT_Finetuned.png")
 
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的测试集上评估...")
@@ -207,6 +221,12 @@ def main():
         return
 
     model.load_state_dict(torch.load(save_path, map_location=device))
+
+    # 🚀 修改 5：开启 LV-UNet 的重参数化推理部署模式 (提升推理速度)
+    if DEEP_TRAINING:
+        model.switch_to_deploy()
+        print("⚡ 已开启 LV-UNet 重参数化部署模式 (switch_to_deploy)")
+
     model.eval()
 
     print("🔥 GPU 预热 (Warm-up)...")
@@ -223,17 +243,19 @@ def main():
 
             if torch.cuda.is_available(): torch.cuda.synchronize()
             t0 = time.time()
-            outputs = model(images)
+
+            # LV_UNet 推理
+            outputs = torch.sigmoid(model(images))
+
             if torch.cuda.is_available(): torch.cuda.synchronize()
 
             total_time += (time.time() - t0)
             total_samples += images.size(0)
 
-            if isinstance(outputs, tuple): outputs = outputs[0]
             m = calculate_metrics(outputs, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 nnUNet (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print("\n🏆 LV-UNet (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
@@ -242,6 +264,7 @@ def main():
     print(
         f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

@@ -4,97 +4,24 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import gc
 
-
 # ==========================================
-# 1. UNet++ 核心模块 (标准版，无深监督)
+# 1. 导入 segmentation_models_pytorch 库
+# 提示：如果尚未安装，请在终端运行: pip install segmentation-models-pytorch
+# 或者确保你的代码与下载的 github 源码处于同一级目录
 # ==========================================
-class VGGBlock(nn.Module):
-    def __init__(self, in_channels, middle_channels, out_channels):
-        super().__init__()
-        self.relu = nn.ReLU(inplace=True)
-        self.conv1 = nn.Conv2d(in_channels, middle_channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(middle_channels)
-        self.conv2 = nn.Conv2d(middle_channels, out_channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-    def forward(self, x):
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        return out
-
-
-class UNetPlusPlus(nn.Module):
-    def __init__(self, num_classes=1, input_channels=3):
-        super().__init__()
-        nb_filter = [32, 64, 128, 256, 512]
-
-        # 编码器
-        self.conv0_0 = VGGBlock(input_channels, nb_filter[0], nb_filter[0])
-        self.conv1_0 = VGGBlock(nb_filter[0], nb_filter[1], nb_filter[1])
-        self.conv2_0 = VGGBlock(nb_filter[1], nb_filter[2], nb_filter[2])
-        self.conv3_0 = VGGBlock(nb_filter[2], nb_filter[3], nb_filter[3])
-        self.conv4_0 = VGGBlock(nb_filter[3], nb_filter[4], nb_filter[4])
-
-        # 嵌套跳跃连接节点 (Dense Block 结构)
-        self.conv0_1 = VGGBlock(nb_filter[0] + nb_filter[1], nb_filter[0], nb_filter[0])
-        self.conv1_1 = VGGBlock(nb_filter[1] + nb_filter[2], nb_filter[1], nb_filter[1])
-        self.conv2_1 = VGGBlock(nb_filter[2] + nb_filter[3], nb_filter[2], nb_filter[2])
-        self.conv3_1 = VGGBlock(nb_filter[3] + nb_filter[4], nb_filter[3], nb_filter[3])
-
-        self.conv0_2 = VGGBlock(nb_filter[0] * 2 + nb_filter[1], nb_filter[0], nb_filter[0])
-        self.conv1_2 = VGGBlock(nb_filter[1] * 2 + nb_filter[2], nb_filter[1], nb_filter[1])
-        self.conv2_2 = VGGBlock(nb_filter[2] * 2 + nb_filter[3], nb_filter[2], nb_filter[2])
-
-        self.conv0_3 = VGGBlock(nb_filter[0] * 3 + nb_filter[1], nb_filter[0], nb_filter[0])
-        self.conv1_3 = VGGBlock(nb_filter[1] * 3 + nb_filter[2], nb_filter[1], nb_filter[1])
-
-        self.conv0_4 = VGGBlock(nb_filter[0] * 4 + nb_filter[1], nb_filter[0], nb_filter[0])
-
-        self.pool = nn.MaxPool2d(2, 2)
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.final = nn.Conv2d(nb_filter[0], num_classes, kernel_size=1)
-
-    def forward(self, input):
-        # Column 0
-        x0_0 = self.conv0_0(input)
-        x1_0 = self.conv1_0(self.pool(x0_0))
-        x2_0 = self.conv2_0(self.pool(x1_0))
-        x3_0 = self.conv3_0(self.pool(x2_0))
-        x4_0 = self.conv4_0(self.pool(x3_0))
-
-        # Column 1
-        x0_1 = self.conv0_1(torch.cat([x0_0, self.up(x1_0)], 1))
-        x1_1 = self.conv1_1(torch.cat([x1_0, self.up(x2_0)], 1))
-        x2_1 = self.conv2_1(torch.cat([x2_0, self.up(x3_0)], 1))
-        x3_1 = self.conv3_1(torch.cat([x3_0, self.up(x4_0)], 1))
-
-        # Column 2
-        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up(x1_1)], 1))
-        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up(x2_1)], 1))
-        x2_2 = self.conv2_2(torch.cat([x2_0, x2_1, self.up(x3_1)], 1))
-
-        # Column 3
-        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up(x1_2)], 1))
-        x1_3 = self.conv1_3(torch.cat([x1_0, x1_1, x1_2, self.up(x2_2)], 1))
-
-        # Column 4 (Final output)
-        x0_4 = self.conv0_4(torch.cat([x0_0, x0_1, x0_2, x0_3, self.up(x1_3)], 1))
-
-        return torch.sigmoid(self.final(x0_4))
+import segmentation_models_pytorch as smp
 
 
 # ==========================================
-# 2. 混合损失函数与指标计算
+# 2. 混合损失函数与指标计算 (保持原样)
 # ==========================================
 class HybridLoss(nn.Module):
     def __init__(self, weight_bce=0.4, weight_jaccard=0.6):
@@ -114,7 +41,6 @@ class HybridLoss(nn.Module):
         return (self.weight_bce * bce_loss) + (self.weight_jaccard * jaccard_loss.mean())
 
 
-
 def calculate_metrics(pred, target, smooth=1e-5):
     pred_bin = (pred > 0.5).float()
     target_bin = target.float()
@@ -132,9 +58,8 @@ def calculate_metrics(pred, target, smooth=1e-5):
     return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
 
 
-
 # ==========================================
-# 3. 数据集读取 (回归原始方式)
+# 3. 数据集读取 (保持原样)
 # ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -171,30 +96,21 @@ def get_dataset_paths(data_dir):
     return image_paths, mask_paths
 
 
-
 # ==========================================
-# 5. 主控台
+# 4. 主控台
 # ==========================================
 def main():
-
-    # ==========================================
-    # 1. 运行模式设置
-    # ==========================================
-    MODE = "test"  # 可选: "train" 或 "test"
+    MODE = "train"  # 可选: "train" 或 "test"
     save_path = "best_busi.pth"
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
 
-    # ==========================================
-    # 2. 数据集加载与划分
-    # ==========================================
     all_imgs, all_masks = get_dataset_paths(data_dir)
     total_size = len(all_imgs)
     if total_size == 0:
         print("❌ 未找到数据！请检查路径。")
-        # 如果在函数外直接 return 会报错，建议用 sys.exit() 或放在 main() 中
         exit()
 
     combined = list(zip(all_imgs, all_masks))
@@ -220,13 +136,20 @@ def main():
     print(f"✅ 数据加载完毕 | Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
 
     # ==========================================
-    # 3. 模型与损失函数初始化
+    # 🌟 替换部分：初始化官方 SMP 结构的 UNet++ 模型
     # ==========================================
-    model = UNetPlusPlus().to(device)
+    model = smp.UnetPlusPlus(
+        encoder_name="resnet34",        # 选择编码器架构 (可替换为 mobilenet_v2, efficientnet-b3 等)
+        encoder_weights="imagenet",     # 使用 ImageNet 预训练权重加速收敛
+        in_channels=3,                  # 输入通道数 (RGB图像为3)
+        classes=1,                      # 输出类别数 (二分类为1)
+        activation="sigmoid"            # 直接输出概率分布，完美兼容下方的 BCELoss
+    ).to(device)
+
     criterion = HybridLoss()
 
     # ==========================================
-    # 4. 训练模式 (Train)
+    # 5. 训练模式 (Train)
     # ==========================================
     if MODE == "train":
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
@@ -235,14 +158,13 @@ def main():
 
         best_val_dice = 0.0
 
-        # 初始化绘图
         plt.ion()
         fig, ax1 = plt.subplots(figsize=(10, 6))
         ax2 = ax1.twinx()
         ax1.set_xlabel('Epochs')
         ax1.set_ylabel('Train Loss', color='tab:red')
         ax2.set_ylabel('Validation Dice', color='tab:blue')
-        plt.title('Baseline Training Progress (TransUNet)')
+        plt.title('SMP UNet++ Training Progress')
         line_loss, = ax1.plot([], [], color='tab:red', marker='o', label='Train Loss')
         line_dice, = ax2.plot([], [], color='tab:blue', marker='s', label='Val Dice')
         ax1.legend([line_loss, line_dice], ['Train Loss', 'Val Dice'], loc='center right')
@@ -280,7 +202,6 @@ def main():
             print(
                 f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
-            # 更新绘图数据
             epochs_list.append(epoch + 1)
             history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
@@ -293,7 +214,6 @@ def main():
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-            # 保存最佳模型
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
                 torch.save(model.state_dict(), save_path)
@@ -302,12 +222,12 @@ def main():
             torch.cuda.empty_cache()
             gc.collect()
 
-        # 结束绘图
         plt.ioff()
         plt.savefig('baseline_training_curve.png', dpi=150)
         print("📈 基线训练曲线已保存为 baseline_training_curve.png")
+
     # ==========================================
-    # 5. 测试模式 (Test) / 全指标评估
+    # 6. 测试模式 (Test) / 全指标评估
     # ==========================================
     if MODE in ["train", "test"]:
         print("\n" + "=" * 50)
@@ -354,7 +274,7 @@ def main():
 
             avg_time_per_image = (total_infer_time / total_samples) * 1000
             fps = 1.0 / (total_infer_time / total_samples)
-            print("\n🏆 unetplusplus (BUSI dataset)  最终测试集成绩 🏆")
+            print("\n🏆 SMP UNet++ (BUSI dataset)  最终测试集成绩 🏆")
             print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
             print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
             print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")

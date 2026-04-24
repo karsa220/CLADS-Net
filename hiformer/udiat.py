@@ -1,22 +1,28 @@
 import os
 import random
 import time
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from hiformer.main import HybridLoss
+from main import HybridLoss
+from main import calculate_metrics
 
+# ==========================================
+# 【新增】导入官方 HiFormer 模块
+# 请确保当前运行路径能找到 models 和 configs 文件夹
+# ==========================================
+from models.HiFormer import HiFormer
+from configs.HiFormer_configs import get_hiformer_b_configs, get_hiformer_s_configs, get_hiformer_l_configs
 
-from hiformer.main import calculate_metrics
 
 # ==========================================
 # 6. UDIAT 数据集加载 (原图/GT结构)
@@ -32,8 +38,9 @@ class UDIATDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        image = TF.resize(image, (256, 256))
-        mask = TF.resize(mask, (256, 256))
+        # 注意这里尺寸是 224x224
+        image = TF.resize(image, (224, 224))
+        mask = TF.resize(mask, (224, 224))
 
         if self.is_train:
             # 1. 随机水平翻转
@@ -112,11 +119,18 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    from hiformer.main import HiFormer
-    model = HiFormer().to(device)
+    # ==========================
+    # 【修改 2】使用官方 HiFormer 结构，并覆盖默认图片大小
+    # ==========================
+    config = get_hiformer_b_configs()
+
+    config.image_size = 224
+
+    # 实例化官方模型，病灶分割为单类 (n_classes=1)
+    model = HiFormer(config=config, img_size=224, in_chans=3, n_classes=1).to(device)
 
     if MODE == "train":
-        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        # 🚀 修改 3：在开启训练前，加载 BUSI 的预训练权重
         if os.path.exists(pretrained_busi_path):
             print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
@@ -131,7 +145,7 @@ def main():
 
         criterion = HybridLoss()
 
-        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
+        # 🚀 修改 4：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
         fine_tune_lr = 1e-4
         optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
 
@@ -149,7 +163,10 @@ def main():
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
+
                 outputs = model(images)
+                outputs = torch.sigmoid(outputs)  # 【核心修改】官方模型输出未激活的 logits，需经过 Sigmoid
+
                 loss = criterion(outputs, masks)
 
                 loss.backward()
@@ -165,7 +182,8 @@ def main():
             with torch.no_grad():
                 for images, masks in val_loader:
                     out = model(images.to(device))
-                    # 适配你的输出元组形式或单输出形式
+                    out = torch.sigmoid(out)  # 【核心修改】验证集同样需要 Sigmoid
+
                     if isinstance(out, tuple): out = out[0]
                     val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
@@ -179,7 +197,6 @@ def main():
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                # 🚀 修改 4：保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
@@ -194,8 +211,8 @@ def main():
         plt.title("Val Dice");
         plt.grid()
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
+        plt.savefig('training_curve_HiFormer_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_HiFormer_UDIAT_Finetuned.png")
 
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的测试集上评估...")
@@ -212,8 +229,9 @@ def main():
 
     print("🔥 GPU 预热 (Warm-up)...")
     with torch.no_grad():
-        for _ in range(5): model(torch.randn(1, 3, 256, 256).to(device))
+        for _ in range(5): model(torch.randn(1, 3, 224, 224).to(device))
     if torch.cuda.is_available(): torch.cuda.synchronize()
+
 
     test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
     total_time, total_samples = 0.0, 0
@@ -224,7 +242,10 @@ def main():
 
             if torch.cuda.is_available(): torch.cuda.synchronize()
             t0 = time.time()
+
             outputs = model(images)
+            outputs = torch.sigmoid(outputs)  # 【核心修改】测试集同样需要 Sigmoid
+
             if torch.cuda.is_available(): torch.cuda.synchronize()
 
             total_time += (time.time() - t0)
@@ -234,7 +255,7 @@ def main():
             m = calculate_metrics(outputs, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 hiformer (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print("\n🏆 HiFormer (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
@@ -243,6 +264,7 @@ def main():
     print(
         f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

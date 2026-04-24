@@ -2,6 +2,7 @@ import os
 import random
 import time
 import gc
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,193 +14,14 @@ from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-
 # ==========================================
-# 1. CT-Net 模型定义 (Zhang et al., 2024)
+# 1. 导入 LV-UNet 模型 (替换了原有的 U-Net)
 # ==========================================
-
-class CNNBlock(nn.Module):
-    """局部特征提取：双层标准卷积"""
-
-    def __init__(self, in_c, out_c):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_c, out_c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.GELU(),
-            nn.Conv2d(out_c, out_c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.GELU()
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class TransformerBlock(nn.Module):
-    """全局特征提取：标准自注意力机制"""
-
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Linear(dim * 2, dim)
-        )
-
-    def forward(self, x):
-        # x: [B, N, C]
-        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
-        x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class TransBranch(nn.Module):
-    """CT-Net 并行 Transformer 分支 (处理 Patch 以获取全局依赖)"""
-
-    def __init__(self, in_channels, embed_dim, img_size, patch_size=16):
-        super().__init__()
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-        self.num_patches = (img_size // patch_size) ** 2
-
-        # 将图片划分 patch 并线性映射
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-
-        self.blocks = nn.Sequential(
-            TransformerBlock(embed_dim, num_heads=4),
-            TransformerBlock(embed_dim, num_heads=4)
-        )
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x = self.proj(x)  # [B, embed_dim, H/16, W/16]
-        Hp, Wp = x.shape[2], x.shape[3]
-
-        x = x.flatten(2).transpose(1, 2)  # [B, N, embed_dim]
-        x = x + self.pos_embed
-        x = self.blocks(x)
-
-        # 还原回 2D 空间维度以备融合
-        x = x.transpose(1, 2).reshape(B, self.embed_dim, Hp, Wp)
-        return x
-
-
-class HighDensityFusion(nn.Module):
-    """
-    CT-Net 极轻量级高密度融合模块 (论文核心)
-    参数量极低 (~0.05M)，通过空间注意力引导 CNN 和 Transformer 特征的高效融合。
-    """
-
-    def __init__(self, cnn_dim, trans_dim, out_dim):
-        super().__init__()
-        self.cnn_proj = nn.Conv2d(cnn_dim, out_dim, 1)
-        self.trans_proj = nn.Conv2d(trans_dim, out_dim, 1)
-
-        # 生成基于交叉通道特征的空间注意力权重
-        self.spatial_attn = nn.Sequential(
-            nn.Conv2d(out_dim * 2, out_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_dim),
-            nn.GELU(),
-            nn.Conv2d(out_dim, 1, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, cnn_feat, trans_feat):
-        # 对齐尺寸 (如果 Transformer patch size 导致维度偏差)
-        if trans_feat.shape[2:] != cnn_feat.shape[2:]:
-            trans_feat = F.interpolate(trans_feat, size=cnn_feat.shape[2:], mode='bilinear', align_corners=False)
-
-        c_p = self.cnn_proj(cnn_feat)
-        t_p = self.trans_proj(trans_feat)
-
-        # 拼接以计算注意力
-        concat_feat = torch.cat([c_p, t_p], dim=1)
-        attn_weight = self.spatial_attn(concat_feat)
-
-        # 软门控 (Soft-gating) 融合
-        fused = c_p * attn_weight + t_p * (1 - attn_weight)
-        return fused
-
-
-class CTNet(nn.Module):
-    """
-    CT-Net: Asymmetric Compound Branch Transformer
-    (非对称复合分支架构)
-    """
-
-    def __init__(self, n_channels=3, n_classes=1, img_size=256):
-        super().__init__()
-
-        # --- Asymmetric Parallel Branches (双分支并行特征提取) ---
-
-        # 1. CNN 分支 (局部细节)
-        self.cnn_inc = CNNBlock(n_channels, 32)
-        self.cnn_down1 = nn.Sequential(nn.MaxPool2d(2), CNNBlock(32, 64))
-        self.cnn_down2 = nn.Sequential(nn.MaxPool2d(2), CNNBlock(64, 128))
-        self.cnn_down3 = nn.Sequential(nn.MaxPool2d(2), CNNBlock(128, 256))
-        self.cnn_down4 = nn.Sequential(nn.MaxPool2d(2), CNNBlock(256, 512))
-
-        # 2. Transformer 分支 (全局上下文)
-        self.trans_branch = TransBranch(in_channels=n_channels, embed_dim=256, img_size=img_size, patch_size=16)
-
-        # --- High-Density Information Fusion (高密度信息融合) ---
-        self.fusion = HighDensityFusion(cnn_dim=512, trans_dim=256, out_dim=512)
-
-        # --- Asymmetric Decoder (非对称解码器) ---
-        self.up1 = nn.ConvTranspose2d(512, 256, 2, stride=2)
-        self.dec1 = CNNBlock(256 + 256, 256)
-
-        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.dec2 = CNNBlock(128 + 128, 128)
-
-        self.up3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec3 = CNNBlock(64 + 64, 64)
-
-        self.up4 = nn.ConvTranspose2d(64, 32, 2, stride=2)
-        self.dec4 = CNNBlock(32 + 32, 32)
-
-        # --- 输出层 ---
-        self.outc = nn.Conv2d(32, n_classes, 1)
-
-    def forward(self, x):
-        # 局部特征路径 (CNN)
-        c1 = self.cnn_inc(x)  # [B, 32, H, W]
-        c2 = self.cnn_down1(c1)  # [B, 64, H/2, W/2]
-        c3 = self.cnn_down2(c2)  # [B, 128, H/4, W/4]
-        c4 = self.cnn_down3(c3)  # [B, 256, H/8, W/8]
-        c5 = self.cnn_down4(c4)  # [B, 512, H/16, W/16]
-
-        # 全局特征路径 (Transformer)
-        t_feat = self.trans_branch(x)  # [B, 256, H/16, W/16]
-
-        # 模块融合 (Fusion)
-        fused = self.fusion(c5, t_feat)  # [B, 512, H/16, W/16]
-
-        # 解码并结合高分辨率跳跃连接
-        d1 = self.up1(fused)
-        d1 = self.dec1(torch.cat([d1, c4], dim=1))
-
-        d2 = self.up2(d1)
-        d2 = self.dec2(torch.cat([d2, c3], dim=1))
-
-        d3 = self.up3(d2)
-        d3 = self.dec3(torch.cat([d3, c2], dim=1))
-
-        d4 = self.up4(d3)
-        d4 = self.dec4(torch.cat([d4, c1], dim=1))
-
-        logits = self.outc(d4)
-        return torch.sigmoid(logits)
+from LV_UNet import LV_UNet
 
 
 # ==========================================
-# 2. 混合损失函数与指标计算 (保持原样)
+# 2. 混合损失函数与指标计算 (保留原版)
 # ==========================================
 class HybridLoss(nn.Module):
     def __init__(self, weight_bce=0.4, weight_jaccard=0.6):
@@ -241,7 +63,7 @@ def calculate_metrics(pred, target, smooth=1e-5):
 
 
 # ==========================================
-# 3. 数据集与增强加载 (保持原样)
+# 3. 数据集与增强加载 (保留原版)
 # ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -256,7 +78,6 @@ class BUSIDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        # 锁定图像分辨率为 256x256，适配 Transformer 分支 patch 处理
         image = TF.resize(image, (256, 256))
         mask = TF.resize(mask, (256, 256))
 
@@ -291,13 +112,20 @@ def get_dataset_paths(data_dir):
 # 4. 主控台
 # ==========================================
 def main():
-    MODE = "train"
-    save_path = "best_busi.pth"
+    # ==========================================
+    # 1. 运行模式设置
+    # ==========================================
+    MODE = "train"  # 可选: "train" 或 "test"
+    DEEP_TRAINING = True  # 开启 LV-UNet 的深度训练特性
+    save_path = "best_busi_lvunet.pth"
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
+    print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()} | Deep Training: {DEEP_TRAINING}")
 
+    # ==========================================
+    # 2. 数据集加载与划分
+    # ==========================================
     all_imgs, all_masks = get_dataset_paths(data_dir)
     total_size = len(all_imgs)
     if total_size == 0:
@@ -327,29 +155,29 @@ def main():
     print(f"✅ 数据加载完毕 | Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
 
     # ==========================================
-    # 初始化 CT-Net 模型
+    # 3. 模型与损失函数初始化 (使用 LV_UNet)
     # ==========================================
-    model = CTNet(n_channels=3, n_classes=1, img_size=256).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"🧩 CT-Net 模型参数量: {total_params / 1e6:.4f} M")
-
+    model = LV_UNet().to(device)
     criterion = HybridLoss()
 
+    # ==========================================
+    # 4. 训练模式 (Train)
+    # ==========================================
     if MODE == "train":
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
         num_epochs = 35
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
 
+        # 初始化绘图
         plt.ion()
         fig, ax1 = plt.subplots(figsize=(10, 6))
         ax2 = ax1.twinx()
         ax1.set_xlabel('Epochs')
         ax1.set_ylabel('Train Loss', color='tab:red')
         ax2.set_ylabel('Validation Dice', color='tab:blue')
-        plt.title('Training Progress (CT-Net)')
+        plt.title('Training Progress (LV-UNet)')
         line_loss, = ax1.plot([], [], color='tab:red', marker='o', label='Train Loss')
         line_dice, = ax2.plot([], [], color='tab:blue', marker='s', label='Val Dice')
         ax1.legend([line_loss, line_dice], ['Train Loss', 'Val Dice'], loc='center right')
@@ -359,11 +187,21 @@ def main():
             model.train()
             train_loss_epoch = 0.0
 
+            # LV-UNet 特性: 动态深度训练 (基于 Cosine 函数调节 LeakyReLU 参数)
+            if DEEP_TRAINING:
+                act_learn = 1 - math.cos(math.pi / 2 * epoch / num_epochs)
+                try:
+                    model.change_act(act_learn)
+                except AttributeError:
+                    pass
+
             pbar_train = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{num_epochs}] Train", leave=False)
             for images, masks in pbar_train:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
-                outputs = model(images)
+
+                # LV_UNet 输出的是 logits，需要经过 sigmoid 转换为 0~1 的概率
+                outputs = torch.sigmoid(model(images))
                 loss = criterion(outputs, masks)
                 loss.backward()
                 optimizer.step()
@@ -378,7 +216,7 @@ def main():
             with torch.no_grad():
                 for images, masks in val_loader:
                     images, masks = images.to(device), masks.to(device)
-                    outputs = model(images)
+                    outputs = torch.sigmoid(model(images))
                     val_dices.extend(calculate_metrics(outputs, masks)["dice"])
 
             avg_val_dice = np.mean(val_dices)
@@ -387,6 +225,7 @@ def main():
             print(
                 f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
+            # 更新绘图数据
             epochs_list.append(epoch + 1)
             history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
@@ -399,26 +238,37 @@ def main():
             fig.canvas.draw()
             fig.canvas.flush_events()
 
+            # 保存最佳模型
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
                 torch.save(model.state_dict(), save_path)
-                print(f"🌟 [New Best CT-Net Saved] Val Dice: {best_val_dice:.4f}")
+                print(f"🌟 [New Best LV-UNet Saved] Val Dice: {best_val_dice:.4f}")
 
             torch.cuda.empty_cache()
             gc.collect()
 
+        # 结束绘图
         plt.ioff()
-        plt.savefig('ctnet_training_curve.png', dpi=150)
-        print("📈 训练曲线已保存为 ctnet_training_curve.png")
+        plt.savefig('lvunet_training_curve.png', dpi=150)
+        print("📈 训练曲线已保存为 lvunet_training_curve.png")
 
+    # ==========================================
+    # 5. 测试模式 (Test) / 全指标评估
+    # ==========================================
     if MODE in ["train", "test"]:
         print("\n" + "=" * 50)
-        print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 CT-Net 最终性能...")
+        print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 LV-UNet 最终性能...")
 
         if not os.path.exists(save_path):
             print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
         else:
             model.load_state_dict(torch.load(save_path, map_location=device))
+
+            # 开启 LV-UNet 的重参数化推理部署模式 (极大地提升推理速度)
+            if DEEP_TRAINING:
+                model.switch_to_deploy()
+                print("⚡ 已开启 LV-UNet 重参数化部署模式 (switch_to_deploy)")
+
             model.eval()
 
             test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
@@ -441,7 +291,7 @@ def main():
                         torch.cuda.synchronize()
                     start_time = time.time()
 
-                    outputs = model(images)
+                    outputs = torch.sigmoid(model(images))
 
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -457,7 +307,7 @@ def main():
             avg_time_per_image = (total_infer_time / total_samples) * 1000
             fps = 1.0 / (total_infer_time / total_samples)
 
-            print("\n🏆 CT-Net (BUSI dataset) 最终测试集成绩 🏆")
+            print("\n🏆 LV-UNet (BUSI dataset) 最终测试集成绩 🏆")
             print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
             print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
             print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")

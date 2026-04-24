@@ -4,123 +4,90 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from setuptools.sandbox import save_path
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import gc
 import time
+import argparse
 
-
-
-
-class ConvBlock(nn.Module):
-    """标准的双层卷积用于解码器"""
-
-    def __init__(self, in_ch, out_ch):
-        super(ConvBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class SwinUNet_Hybrid(nn.Module):
-    """
-    基于 PyTorch 官方 Swin-T 的 UNet 变体：
-    Encoder: Swin Transformer (Tiny)
-    Decoder: CNN + Skip Connections
-    """
-
-    def __init__(self, out_channels=1):
-        super(SwinUNet_Hybrid, self).__init__()
-        # 加载官方预训练的 Swin-T (如果网络不好，会自动下载，稍等片刻即可)
-        swin_model = models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
-        self.features = swin_model.features
-
-        # Swin-T 的阶段通道数分别是: 96, 192, 384, 768
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec4 = ConvBlock(768 + 384, 384)
-
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec3 = ConvBlock(384 + 192, 192)
-
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec2 = ConvBlock(192 + 96, 96)
-
-        # 最后一层恢复到原始分辨率 (Swin 最初有 4x 下采样)
-        self.up1 = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True)
-        self.dec1 = ConvBlock(96, 64)
-
-        self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # 记录每层的特征用于 Skip Connection
-        skips = []
-        out = x
-
-        # Swin-T features 包含 8 个模块：
-        # 0: Patch Partition (B, 96, H/4, W/4)
-        # 1: Swin Stage 1
-        # 2: Patch Merging (B, 192, H/8, W/8)
-        # 3: Swin Stage 2
-        # 4: Patch Merging (B, 384, H/16, W/16)
-        # 5: Swin Stage 3
-        # 6: Patch Merging (B, 768, H/32, W/32)
-        # 7: Swin Stage 4
-
-        for i, module in enumerate(self.features):
-            out = module(out)
-            # 提取 4 个层级的特征 (经过转置恢复成 [B, C, H, W] 格式)
-            if i in [1, 3, 5, 7]:
-                # Swin 输出形状是 [B, H, W, C]，需要转换为 [B, C, H, W]
-                feat = out.permute(0, 3, 1, 2).contiguous()
-                skips.append(feat)
-
-        s1, s2, s3, bottleneck = skips[0], skips[1], skips[2], skips[3]
-
-        # --- Decoder ---
-        d4 = self.dec4(torch.cat([self.up4(bottleneck), s3], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), s2], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), s1], dim=1))
-        d1 = self.dec1(self.up1(d2))
-
-        return torch.sigmoid(self.final_conv(d1))
+# ==========================================
+# 1. 导入官方的 config 和 Swin-Unet 模型
+# 请确保 config.py, networks 文件夹和 configs 文件夹在当前目录下
+# ==========================================
+from config import get_config
+from networks.vision_transformer import SwinUnet as ViT_seg
 
 
 # ==========================================
-# 3. 混合损失函数与指标计算 (完全保留)
+# 2. 官方 Swin-Unet 的包装器
 # ==========================================
-class HybridLoss(nn.Module):
-    def __init__(self, weight_bce=0.4, weight_jaccard=0.6):
-        super(HybridLoss, self).__init__()
+class OfficialSwinUNetWrapper(nn.Module):
+    def __init__(self, img_size=224, num_classes=1, cfg_path='configs/swin_tiny_patch4_window7_224_lite.yaml'):
+        super(OfficialSwinUNetWrapper, self).__init__()
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--cfg', type=str, default=cfg_path, help='path to config file')
+        parser.add_argument("--opts", help="Modify config options", default=None, nargs='+')
+        parser.add_argument('--batch_size', type=int, default=8, help='batch_size per gpu')
+        parser.add_argument('--zip', action='store_true')
+        parser.add_argument('--cache-mode', type=str, default='part')
+        parser.add_argument('--resume', help='resume from checkpoint')
+        parser.add_argument('--accumulation-steps', type=int)
+        parser.add_argument('--use-checkpoint', action='store_true')
+        parser.add_argument('--amp-opt-level', type=str, default='O1')
+        parser.add_argument('--tag', help='tag of experiment')
+        parser.add_argument('--eval', action='store_true')
+        parser.add_argument('--throughput', action='store_true')
+        args = parser.parse_args(args=[])
+
+        config = get_config(args)
+        self.model = ViT_seg(config, img_size=img_size, num_classes=num_classes)
+
+        if os.path.exists(config.MODEL.PRETRAIN_CKPT):
+            self.model.load_from(config)
+        else:
+            print(f"⚠️ 未找到预训练权重 {config.MODEL.PRETRAIN_CKPT}，将随机初始化从头开始训练。")
+
+    def forward(self, x):
+        logits = self.model(x)
+        return torch.sigmoid(logits)
+
+
+# ==========================================
+# 3. 混合损失函数与指标计算 (替换为官方策略)
+# ==========================================
+class OfficialDiceLoss(nn.Module):
+    """提取自官方 utils.py 的 Dice 计算逻辑"""
+
+    def __init__(self):
+        super(OfficialDiceLoss, self).__init__()
+
+    def forward(self, score, target):
+        target = target.float()
+        smooth = 1e-5
+        intersect = torch.sum(score * target)
+        y_sum = torch.sum(target * target)
+        z_sum = torch.sum(score * score)
+        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+        return 1.0 - loss
+
+
+class OfficialHybridLoss(nn.Module):
+    """匹配官方 trainer.py 的 loss 组合: 0.4 * CE(此处对应BCE) + 0.6 * Dice"""
+
+    def __init__(self, weight_bce=0.4, weight_dice=0.6):
+        super(OfficialHybridLoss, self).__init__()
         self.bce = nn.BCELoss()
+        self.dice = OfficialDiceLoss()
         self.weight_bce = weight_bce
-        self.weight_jaccard = weight_jaccard
+        self.weight_dice = weight_dice
 
     def forward(self, pred, target):
         bce_loss = self.bce(pred, target)
-        smooth = 1e-5
-
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
-
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - intersection
-
-        jaccard_loss = 1.0 - (intersection + smooth) / (union + smooth)
-
-        return (self.weight_bce * bce_loss) + (self.weight_jaccard * jaccard_loss.mean())
+        dice_loss = self.dice(pred, target)
+        return (self.weight_bce * bce_loss) + (self.weight_dice * dice_loss)
 
 
 def calculate_metrics(pred, target, smooth=1e-5):
@@ -139,8 +106,9 @@ def calculate_metrics(pred, target, smooth=1e-5):
     rec = (tp + smooth) / (tp + fn + smooth)
     return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
 
+
 # ==========================================
-# 4. 数据集与增强加载 (完全保留)
+# 4. 数据集与增强加载
 # ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -155,14 +123,15 @@ class BUSIDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        image = TF.resize(image, (256, 256))
-        mask = TF.resize(mask, (256, 256))
+        image = TF.resize(image, (224, 224))
+        mask = TF.resize(mask, (224, 224))
 
         if self.is_train:
             if random.random() > 0.5:
                 image = TF.hflip(image)
                 mask = TF.hflip(mask)
-            angle = random.uniform(-15, 15)
+            # 官方默认使用 -20 ~ 20 的随机旋转
+            angle = random.uniform(-20, 20)
             image = TF.rotate(image, angle)
             mask = TF.rotate(mask, angle)
 
@@ -220,26 +189,34 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
 
     print(f"✅ 数据加载完毕 | Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
-    MODE = "test"
-    # 🌟 修改点：在此处实例化你的 Baseline (TransUNet)
-    model = SwinUNet_Hybrid().to(device)
-    criterion = HybridLoss()
-    save_path="best_busi.pth"
+    MODE = "train"
+
+    model = OfficialSwinUNetWrapper(img_size=224, num_classes=1).to(device)
+
+    # 使用修改为官方的组合损失： 0.4 BCE + 0.6 Dice
+    criterion = OfficialHybridLoss()
+    save_path = "best_busi.pth"
+
     if MODE == "train":
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+        # 官方使用 SGD 而不是 Adam，使用 momentum 和 weight_decay
+        # 根据 batch size，通常基础学习率在 0.01 到 0.05 之间，这里使用 default=0.01
+        base_lr = 0.01
+        optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
         num_epochs = 35
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+
+        # 官方使用的按 iteration 更新的 poly decay，无需 pytorch 自带的 Scheduler
+        iter_num = 0
+        max_iterations = num_epochs * len(train_loader)
 
         best_val_dice = 0.0
 
-        # 初始化绘图
         plt.ion()
         fig, ax1 = plt.subplots(figsize=(10, 6))
         ax2 = ax1.twinx()
         ax1.set_xlabel('Epochs')
         ax1.set_ylabel('Train Loss', color='tab:red')
         ax2.set_ylabel('Validation Dice', color='tab:blue')
-        plt.title('Baseline Training Progress (TransUNet)')
+        plt.title('Official Swin-Unet Training Progress')
         line_loss, = ax1.plot([], [], color='tab:red', marker='o', label='Train Loss')
         line_dice, = ax2.plot([], [], color='tab:blue', marker='s', label='Val Dice')
         ax1.legend([line_loss, line_dice], ['Train Loss', 'Val Dice'], loc='center right')
@@ -258,8 +235,14 @@ def main():
                 loss.backward()
                 optimizer.step()
 
+                # 按照官方源码 trainer.py 中的 Poly Decay 更新学习率
+                lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_
+                iter_num += 1
+
                 train_loss_epoch += loss.item()
-                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}"})
+                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{lr_:.6f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
 
@@ -272,10 +255,9 @@ def main():
                     val_dices.extend(calculate_metrics(outputs, masks)["dice"])
 
             avg_val_dice = np.mean(val_dices)
-            scheduler.step()
 
             print(
-                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | End LR: {lr_:.6f}")
 
             # 更新绘图数据
             epochs_list.append(epoch + 1)
@@ -290,7 +272,6 @@ def main():
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-            # 保存最佳模型
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
                 torch.save(model.state_dict(), save_path)
@@ -299,13 +280,10 @@ def main():
             torch.cuda.empty_cache()
             gc.collect()
 
-        # 结束绘图
         plt.ioff()
         plt.savefig('baseline_training_curve.png', dpi=150)
         print("📈 基线训练曲线已保存为 baseline_training_curve.png")
-    # ==========================================
-    # 5. 测试模式 (Test) / 全指标评估
-    # ==========================================
+
     if MODE in ["train", "test"]:
         print("\n" + "=" * 50)
         print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 Baseline 最终性能...")
@@ -318,7 +296,8 @@ def main():
 
             test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
             print("🔥 正在进行 GPU 预热 (Warm-up)...")
-            dummy_input = torch.randn(1, 3, 256, 256).to(device)
+
+            dummy_input = torch.randn(1, 3, 224, 224).to(device)
             with torch.no_grad():
                 for _ in range(10):
                     _ = model(dummy_input)

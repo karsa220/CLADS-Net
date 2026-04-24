@@ -12,11 +12,11 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import segmentation_models_pytorch as smp
+from main import HybridLoss
 
-from unetplusplus.main import HybridLoss
 
-from unetplusplus.main import UNetPlusPlus
-from unetplusplus.main import calculate_metrics
+from main import calculate_metrics
 
 # ==========================================
 # 6. UDIAT 数据集加载 (原图/GT结构)
@@ -112,8 +112,13 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = UNetPlusPlus().to(device)
-
+    model = smp.UnetPlusPlus(
+        encoder_name="resnet34",  # 选择编码器架构 (可替换为 mobilenet_v2, efficientnet-b3 等)
+        encoder_weights="imagenet",  # 使用 ImageNet 预训练权重加速收敛
+        in_channels=3,  # 输入通道数 (RGB图像为3)
+        classes=1,  # 输出类别数 (二分类为1)
+        activation="sigmoid"  # 直接输出概率分布，完美兼容下方的 BCELoss
+    ).to(device)
     if MODE == "train":
         # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
         if os.path.exists(pretrained_busi_path):

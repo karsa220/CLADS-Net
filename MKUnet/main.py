@@ -98,7 +98,7 @@ def get_dataset_paths(data_dir):
 # ==========================================
 def main():
     MODE = "train"  # 训练完后可以改成 "test" 仅测试
-    save_path = "best_busi_official.pth"
+    save_path = "best_busi.pth"
 
     # 请确保路径正确
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
@@ -146,7 +146,7 @@ def main():
     if MODE == "train":
         # 官方代码中默认的学习率是 0.0005，使用 AdamW
         optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-        num_epochs = 50
+        num_epochs = 35
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0

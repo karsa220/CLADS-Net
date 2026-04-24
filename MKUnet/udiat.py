@@ -12,11 +12,11 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import gc
+from main import structure_loss
 
-from MKUnet.main import HybridLoss
-
-from MKUnet.main import MK_UNet
-from MKUnet.main import calculate_metrics
+from main import MK_UNet
+from main import calculate_metrics
 
 # ==========================================
 # 6. UDIAT 数据集加载 (原图/GT结构)
@@ -86,23 +86,27 @@ def get_udiat_paths(data_dir):
     return img_p, mask_p
 
 
+
+
 # ==========================================
-# 7. 主控台
+# 7. 主控台 (UDIAT 微调版 - 已修复)
 # ==========================================
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
     MODE = "train"  # "train" 训练(微调) | "test" 直接评估
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
-    # 🚀 修改 1：定义预训练权重和新权重的路径
+    # 🚀 定义预训练权重和新权重的路径
     pretrained_busi_path = "best_busi.pth"
-    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
+    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
 
     all_imgs, all_masks = get_udiat_paths(data_dir)
-    if not all_imgs: return
+    if not all_imgs:
+        print("❌ 未找到数据！请检查路径。")
+        return
 
     combined = list(zip(all_imgs, all_masks))
     random.seed(42)
@@ -112,10 +116,10 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = MK_UNet().to(device)
+    model = MK_UNet(num_classes=1, in_channels=3).to(device)
 
     if MODE == "train":
-        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        # 🚀 在开启训练前，加载 BUSI 的预训练权重
         if os.path.exists(pretrained_busi_path):
             print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
@@ -128,11 +132,9 @@ def main():
             UDIATDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False), batch_size=8,
             shuffle=False)
 
-        criterion = HybridLoss()
-
-        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
+        # 🚀 降低微调的学习率。从 5e-4 降低到 1e-4，防止破坏原本学好的特征
         fine_tune_lr = 1e-4
-        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+        optimizer = optim.AdamW(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
 
         num_epochs = 50
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -143,33 +145,47 @@ def main():
         for epoch in range(num_epochs):
             model.train()
             train_loss_epoch = 0.0
-            pbar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{num_epochs}]", leave=False)
 
-            for images, masks in pbar:
+            pbar_train = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{num_epochs}] Train", leave=False)
+            for images, masks in pbar_train:
                 images, masks = images.to(device), masks.to(device)
+
                 optimizer.zero_grad()
                 outputs = model(images)
-                loss = criterion(outputs, masks)
 
+                # 统一解析模型输出
+                logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
+                # 计算损失并反向传播
+                loss = structure_loss(logits, masks)
                 loss.backward()
+
+                # 梯度裁剪防止爆炸
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 optimizer.step()
+
                 train_loss_epoch += loss.item()
-                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
+                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
 
-            # 验证评估
+            # --- Validation 阶段 ---
             model.eval()
             val_dices = []
             with torch.no_grad():
                 for images, masks in val_loader:
-                    out = model(images.to(device))
-                    # 适配你的输出元组形式或单输出形式
-                    if isinstance(out, tuple): out = out[0]
-                    val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
+                    images, masks = images.to(device), masks.to(device)
+                    outputs = model(images)
+                    logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
+                    # 在计算 Dice 之前，需要手动将 logits 转换为概率 (Sigmoid)
+                    probs = torch.sigmoid(logits)
+                    val_dices.extend(calculate_metrics(probs, masks)["dice"])
 
             avg_val_dice = np.mean(val_dices)
             scheduler.step()
+
+            # 💡 修复：将数据追加到列表中，用于后续画图
             history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
 
@@ -178,70 +194,87 @@ def main():
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                # 🚀 修改 4：保存微调后的最佳模型
+                # 保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
+            torch.cuda.empty_cache()
+            gc.collect()
+
         # 训练结束后静态绘制曲线图
         plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1);
-        plt.plot(history_loss, marker='o');
-        plt.title("Train Loss");
-        plt.grid()
-        plt.subplot(1, 2, 2);
-        plt.plot(history_val_dice, marker='s', color='orange');
-        plt.title("Val Dice");
-        plt.grid()
+        plt.subplot(1, 2, 1)
+        plt.plot(history_loss, marker='o', color='tab:red')
+        plt.title("Train Loss")
+        plt.xlabel("Epoch")
+        plt.grid(True)
+
+        plt.subplot(1, 2, 2)
+        plt.plot(history_val_dice, marker='s', color='tab:blue')
+        plt.title("Val Dice")
+        plt.xlabel("Epoch")
+        plt.grid(True)
+
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
+        plt.savefig('training_curve_MKUNet_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_MKUNet_UDIAT_Finetuned.png")
 
-    print("\n" + "=" * 50)
-    print("🚀 开始在完全未见的测试集上评估...")
-    test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
-                             batch_size=1, shuffle=False)
+    if MODE in ["train", "test"]:
+        print("\n" + "=" * 50)
+        print("🚀 开始在完全未见的 UDIAT 测试集上评估...")
+        test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
+                                 batch_size=1, shuffle=False)
 
-    # 测试阶段：加载微调后保存的最新权重
-    if not os.path.exists(save_path):
-        print(f"❌ 找不到权重文件 {save_path}！请先运行 train 模式。")
-        return
+        # 测试阶段：加载微调后保存的最新权重
+        if not os.path.exists(save_path):
+            print(f"❌ 找不到权重文件 {save_path}！请先运行 train 模式。")
+            return
 
-    model.load_state_dict(torch.load(save_path, map_location=device))
-    model.eval()
+        model.load_state_dict(torch.load(save_path, map_location=device))
+        model.eval()
 
-    print("🔥 GPU 预热 (Warm-up)...")
-    with torch.no_grad():
-        for _ in range(5): model(torch.randn(1, 3, 256, 256).to(device))
-    if torch.cuda.is_available(): torch.cuda.synchronize()
+        print("🔥 GPU 预热 (Warm-up)...")
+        with torch.no_grad():
+            for _ in range(5):
+                _ = model(torch.randn(1, 3, 256, 256).to(device))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-    test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
-    total_time, total_samples = 0.0, 0
+        test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
+        total_time, total_samples = 0.0, 0
 
-    with torch.no_grad():
-        for images, masks in tqdm(test_loader, desc="Testing"):
-            images, masks = images.to(device), masks.to(device)
+        with torch.no_grad():
+            for images, masks in tqdm(test_loader, desc="Testing"):
+                images, masks = images.to(device), masks.to(device)
 
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t0 = time.time()
-            outputs = model(images)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                t0 = time.time()
 
-            total_time += (time.time() - t0)
-            total_samples += images.size(0)
+                outputs = model(images)
 
-            if isinstance(outputs, tuple): outputs = outputs[0]
-            m = calculate_metrics(outputs, masks)
-            for k in test_res: test_res[k].extend(m[k])
+                if torch.cuda.is_available(): torch.cuda.synchronize()
 
-    print("\n🏆 MKUnet (UDIAT Finetuned) 测试集最终成绩 🏆")
-    print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
-    print(
-        f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
-    print("-" * 50)
-    print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
-    print(
-        f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
-    print("=" * 50)
+                total_time += (time.time() - t0)
+                total_samples += images.size(0)
+
+                # 💡 修复：统一解析并加入 Sigmoid 激活！
+                logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+                probs = torch.sigmoid(logits)
+
+                m = calculate_metrics(probs, masks)
+                for k in test_res:
+                    test_res[k].extend(m[k])
+
+        print("\n🏆 MKUnet (UDIAT Finetuned) 测试集最终成绩 🏆")
+        print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
+        print(
+            f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
+        print("-" * 50)
+        print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
+        print(
+            f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
+        print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

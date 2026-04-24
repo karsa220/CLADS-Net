@@ -7,19 +7,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from transunet.main import HybridLoss
+# ==========================================
+# 导入官方 TransUNet 依赖
+# ==========================================
+from networks.vit_seg_modeling import VisionTransformer as ViT_seg
+from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
+from utils import DiceLoss
 
-from transunet.main import TransUNet
-from transunet.main import calculate_metrics
 
 # ==========================================
-# 6. UDIAT 数据集加载 (原图/GT结构)
+# 1. 评估指标计算 (适配官方多通道输出)
+# ==========================================
+def calculate_metrics(pred_bin, target, smooth=1e-5):
+    # pred_bin 和 target 的 shape 均为 (B, H, W)
+    pred_flat = pred_bin.view(pred_bin.size(0), -1).float()
+    target_flat = target.view(target.size(0), -1).float()
+
+    tp = (pred_flat * target_flat).sum(dim=1)
+    fp = (pred_flat * (1 - target_flat)).sum(dim=1)
+    fn = ((1 - pred_flat) * target_flat).sum(dim=1)
+    tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
+
+    dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
+    iou = (tp + smooth) / (tp + fp + fn + smooth)
+    acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
+    pre = (tp + smooth) / (tp + fp + smooth)
+    rec = (tp + smooth) / (tp + fn + smooth)
+    return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
+
+
+# ==========================================
+# 2. UDIAT 数据集加载 (原图/GT结构)
 # ==========================================
 class UDIATDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -55,8 +78,11 @@ class UDIATDataset(Dataset):
         image = TF.to_tensor(image)
         mask = TF.to_tensor(mask)
 
-        # 【关键修复】加上 ImageNet Normalization
+        # 【关键修复1】加上 ImageNet Normalization
         image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        # 【关键修复2】适配官方 CrossEntropyLoss 的类别标签格式 (H, W) -> LongTensor
+        mask = torch.where(mask > 0.5, 1, 0).squeeze(0).long()
 
         return image, mask
 
@@ -87,16 +113,16 @@ def get_udiat_paths(data_dir):
 
 
 # ==========================================
-# 7. 主控台
+# 3. 主控台
 # ==========================================
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
     MODE = "train"  # "train" 训练(微调) | "test" 直接评估
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
-    # 🚀 修改 1：定义预训练权重和新权重的路径
-    pretrained_busi_path = "best_busi.pth"
-    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
+    # 🚀 定义预训练权重和新权重的路径
+    pretrained_busi_path = "best_busi_official.pth"  # 确保这里加载的是用官方代码训练出来的 BUSI 权重
+    save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
@@ -112,30 +138,42 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = TransUNet().to(device)
+    # ==========================================
+    # 官方模型初始化
+    # ==========================================
+    config_vit = CONFIGS_ViT_seg['R50-ViT-B_16']
+    config_vit.n_classes = 2  # 类别数：背景 + 肿块
+    config_vit.n_skip = 3
+    config_vit.patches.grid = (int(256 / 16), int(256 / 16))  # 输入分辨率为 256
+    model = ViT_seg(config_vit, img_size=256, num_classes=2).to(device)
+
+    # 官方损失函数
+    ce_loss = nn.CrossEntropyLoss()
+    dice_loss_func = DiceLoss(2)
 
     if MODE == "train":
-        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        # 🚀 在开启训练前，加载之前使用官方代码训练出的 BUSI 预训练权重
         if os.path.exists(pretrained_busi_path):
             print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
             print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
         else:
-            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！")
+            print(
+                f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！(如已有预训练文件请确认文件名)")
 
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
         val_loader = DataLoader(
             UDIATDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False), batch_size=8,
             shuffle=False)
 
-        criterion = HybridLoss()
-
-        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
-        fine_tune_lr = 1e-4
-        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+        # 🚀 官方优化器设置：SGD, 带有动量和衰减
+        # 因为是微调，我们可以使用比 0.01 略低的基础学习率 (比如 0.001)
+        base_lr = 0.001
+        optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
         num_epochs = 50
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+        max_iterations = num_epochs * len(train_loader)
+        iter_num = 0
 
         best_val_dice = 0.0
         history_loss, history_val_dice = [], []
@@ -148,13 +186,25 @@ def main():
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
+
                 outputs = model(images)
-                loss = criterion(outputs, masks)
+
+                # 官方 Loss 组合：0.5 CE + 0.5 Dice
+                loss_ce = ce_loss(outputs, masks)
+                loss_dice = dice_loss_func(outputs, masks, softmax=True)
+                loss = 0.5 * loss_ce + 0.5 * loss_dice
 
                 loss.backward()
                 optimizer.step()
+
+                # 官方 Poly 学习率衰减策略
+                lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_
+                iter_num += 1
+
                 train_loss_epoch += loss.item()
-                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
+                pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{lr_:.6f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
 
@@ -164,21 +214,18 @@ def main():
             with torch.no_grad():
                 for images, masks in val_loader:
                     out = model(images.to(device))
-                    # 适配你的输出元组形式或单输出形式
-                    if isinstance(out, tuple): out = out[0]
-                    val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
+                    # 转换模型输出 logits 为具体的类别掩码 (B, H, W)
+                    preds = torch.argmax(torch.softmax(out, dim=1), dim=1)
+                    val_dices.extend(calculate_metrics(preds, masks.to(device))["dice"])
 
             avg_val_dice = np.mean(val_dices)
-            scheduler.step()
             history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
 
-            print(
-                f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+            print(f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {lr_:.6f}")
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                # 🚀 修改 4：保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
@@ -193,8 +240,8 @@ def main():
         plt.title("Val Dice");
         plt.grid()
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
+        plt.savefig('training_curve_Official_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_Official_UDIAT_Finetuned.png")
 
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的测试集上评估...")
@@ -223,17 +270,19 @@ def main():
 
             if torch.cuda.is_available(): torch.cuda.synchronize()
             t0 = time.time()
+
             outputs = model(images)
+            preds = torch.argmax(torch.softmax(outputs, dim=1), dim=1)  # 提取推理结果
+
             if torch.cuda.is_available(): torch.cuda.synchronize()
 
             total_time += (time.time() - t0)
             total_samples += images.size(0)
 
-            if isinstance(outputs, tuple): outputs = outputs[0]
-            m = calculate_metrics(outputs, masks)
+            m = calculate_metrics(preds, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 transunet (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print("\n🏆 Official TransUNet (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
@@ -242,6 +291,7 @@ def main():
     print(
         f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

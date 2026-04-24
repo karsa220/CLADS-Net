@@ -1,123 +1,69 @@
 import os
 import random
 import time
-
+import gc
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
-import matplotlib.pyplot as plt
 from tqdm import tqdm
-import gc
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. 从 Github 源码导入 MISSFormer
+# ==========================================
+# 请确保当前脚本与 MISSFormer 仓库中的 networks 文件夹在同一层级
+from networks.MISSFormer import MISSFormer
 
 
-
-
-class nnUNetBlock(nn.Module):
-    """nn-UNet 的标准卷积块: Conv -> InstanceNorm -> LeakyReLU"""
-
-    def __init__(self, in_ch, out_ch):
-        super(nnUNetBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
-        self.norm1 = nn.InstanceNorm2d(out_ch, affine=True)
-        self.relu1 = nn.LeakyReLU(negative_slope=0.01, inplace=True)
-
-        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False)
-        self.norm2 = nn.InstanceNorm2d(out_ch, affine=True)
-        self.relu2 = nn.LeakyReLU(negative_slope=0.01, inplace=True)
-
-    def forward(self, x):
-        return self.relu2(self.norm2(self.conv2(self.relu1(self.norm1(self.conv1(x))))))
-
-
-class nnUNet_2D(nn.Module):
+class MISSFormerWrapper(nn.Module):
     """
-    高度还原 nn-UNet 2D 拓扑结构：
-    1. 使用步长为 2 的卷积替代 MaxPool
-    2. 使用 TransposeConv 替代 Upsample
+    包装器：用于将 MISSFormer 的输出通过 Sigmoid 激活，
+    以无缝适配下方针对二分类设计的 BCELoss (HybridLoss)。
     """
 
-    def __init__(self, in_channels=3, out_channels=1, base_c=64):
-        super(nnUNet_2D, self).__init__()
-
-        # Encoder
-        self.enc1 = nnUNetBlock(in_channels, base_c)
-        self.down1 = nn.Conv2d(base_c, base_c * 2, kernel_size=2, stride=2, bias=False)
-
-        self.enc2 = nnUNetBlock(base_c * 2, base_c * 2)
-        self.down2 = nn.Conv2d(base_c * 2, base_c * 4, kernel_size=2, stride=2, bias=False)
-
-        self.enc3 = nnUNetBlock(base_c * 4, base_c * 4)
-        self.down3 = nn.Conv2d(base_c * 4, base_c * 8, kernel_size=2, stride=2, bias=False)
-
-        self.enc4 = nnUNetBlock(base_c * 8, base_c * 8)
-        self.down4 = nn.Conv2d(base_c * 8, base_c * 16, kernel_size=2, stride=2, bias=False)
-
-        # Bottleneck
-        self.bottleneck = nnUNetBlock(base_c * 16, base_c * 16)
-
-        # Decoder
-        self.up4 = nn.ConvTranspose2d(base_c * 16, base_c * 8, kernel_size=2, stride=2, bias=False)
-        self.dec4 = nnUNetBlock(base_c * 16, base_c * 8)
-
-        self.up3 = nn.ConvTranspose2d(base_c * 8, base_c * 4, kernel_size=2, stride=2, bias=False)
-        self.dec3 = nnUNetBlock(base_c * 8, base_c * 4)
-
-        self.up2 = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2, bias=False)
-        self.dec2 = nnUNetBlock(base_c * 4, base_c * 2)
-
-        self.up1 = nn.ConvTranspose2d(base_c * 2, base_c, kernel_size=2, stride=2, bias=False)
-        self.dec1 = nnUNetBlock(base_c * 2, base_c)
-
-        self.final_conv = nn.Conv2d(base_c, out_channels, kernel_size=1)
+    def __init__(self, n_classes=1):
+        super(MISSFormerWrapper, self).__init__()
+        # 实例化 MISSFormer
+        self.model = MISSFormer(num_classes=n_classes)
 
     def forward(self, x):
-        # Encoder
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.down1(e1))
-        e3 = self.enc3(self.down2(e2))
-        e4 = self.enc4(self.down3(e3))
-
-        # Bottleneck
-        b = self.bottleneck(self.down4(e4))
-
-        # Decoder
-        d4 = self.dec4(torch.cat([self.up4(b), e4], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-
-        out = torch.sigmoid(self.final_conv(d1))
-        return out
+        logits = self.model(x)
+        # 使用 sigmoid 激活以适配二分类概率输出
+        return torch.sigmoid(logits)
 
 
 # ==========================================
-# 3. 混合损失函数与指标计算 (完全保留)
+# 2. 原作者风格的损失函数与指标计算
 # ==========================================
-class HybridLoss(nn.Module):
-    def __init__(self, weight_bce=0.4, weight_jaccard=0.6):
-        super(HybridLoss, self).__init__()
+class AuthorStyleLoss(nn.Module):
+    """
+    完全遵循原作者 trainer.py 中的 Poly Loss 权重：0.4 * CE + 0.6 * Dice
+    由于本任务是二分类，此处使用 BCE 替代 CE 进行等价转换。
+    """
+
+    def __init__(self):
+        super(AuthorStyleLoss, self).__init__()
         self.bce = nn.BCELoss()
-        self.weight_bce = weight_bce
-        self.weight_jaccard = weight_jaccard
 
     def forward(self, pred, target):
-        bce_loss = self.bce(pred, target)
+        # 1. 0.4 * BCE Loss (等价于二分类的 CrossEntropy)
+        loss_bce = self.bce(pred, target)
+
+        # 2. 0.6 * Dice Loss (采用原作者 utils.py 中的 Dice 计算逻辑: smooth=1e-5)
         smooth = 1e-5
+        intersect = torch.sum(pred * target)
+        y_sum = torch.sum(target * target)
+        z_sum = torch.sum(pred * pred)
+        dice = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+        loss_dice = 1 - dice
 
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
-
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - intersection
-
-        jaccard_loss = 1.0 - (intersection + smooth) / (union + smooth)
-
-        return (self.weight_bce * bce_loss) + (self.weight_jaccard * jaccard_loss.mean())
+        # 原作者组合比例
+        return 0.4 * loss_bce + 0.6 * loss_dice
 
 
 def calculate_metrics(pred, target, smooth=1e-5):
@@ -136,8 +82,9 @@ def calculate_metrics(pred, target, smooth=1e-5):
     rec = (tp + smooth) / (tp + fn + smooth)
     return {"dice": dice.tolist(), "iou": iou.tolist(), "acc": acc.tolist(), "pre": pre.tolist(), "rec": rec.tolist()}
 
+
 # ==========================================
-# 4. 数据集与增强加载 (完全保留)
+# 3. 数据集与增强加载 (尺寸修改为原作者的 224)
 # ==========================================
 class BUSIDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -152,8 +99,9 @@ class BUSIDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        image = TF.resize(image, (256, 256))
-        mask = TF.resize(mask, (256, 256))
+        # MISSFormer 特征图尺度与 224x224 强绑定
+        image = TF.resize(image, (224, 224))
+        mask = TF.resize(mask, (224, 224))
 
         if self.is_train:
             if random.random() > 0.5:
@@ -163,7 +111,11 @@ class BUSIDataset(Dataset):
             image = TF.rotate(image, angle)
             mask = TF.rotate(mask, angle)
 
-        return TF.to_tensor(image), TF.to_tensor(mask)
+        # MISSFormer 原作使用 Normalize([0.5], [0.5])
+        image = TF.to_tensor(image)
+        image = TF.normalize(image, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+        return image, TF.to_tensor(mask)
 
 
 def get_dataset_paths(data_dir):
@@ -183,21 +135,34 @@ def get_dataset_paths(data_dir):
 
 
 # ==========================================
-# 5. 主控台
+# 4. 主控台
 # ==========================================
 def main():
+    # ==========================================
+    # 1. 运行模式设置
+    # ==========================================
+    MODE = "train"  # 可选: "train" 或 "test"
+    save_path = "best_busi_missformer.pth"
+
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Using device: {device}")
+    print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
 
+    # ==========================================
+    # 2. 数据集加载与划分
+    # ==========================================
     all_imgs, all_masks = get_dataset_paths(data_dir)
     total_size = len(all_imgs)
     if total_size == 0:
         print("❌ 未找到数据！请检查路径。")
-        return
+        exit()
 
     combined = list(zip(all_imgs, all_masks))
-    random.seed(42)
+    random.seed(1234)  # 采用原作者设定的随机种子
+    np.random.seed(1234)
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
     random.shuffle(combined)
     all_imgs, all_masks = zip(*combined)
 
@@ -218,17 +183,24 @@ def main():
 
     print(f"✅ 数据加载完毕 | Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
 
-    # 🌟 修改点：在此处实例化你的 Baseline (TransUNet)
-    model = nnUNet_2D().to(device)
-    criterion = HybridLoss()
-    save_path = "best_busi.pth"
-    MODE = "test"
+    # ==========================================
+    # 3. 初始化 MISSFormer
+    # ==========================================
+    model = MISSFormerWrapper(n_classes=1).to(device)
+    criterion = AuthorStyleLoss()
 
+    # ==========================================
+    # 4. 训练模式 (Train)
+    # ==========================================
     if MODE == "train":
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 35
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+        # 遵循原作者的优化器设置：SGD, lr=0.05, momentum=0.9, weight_decay=0.0001
+        base_lr = 0.05
+        optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
+        # 遵循原作者的 Epoch 设置与 poly lr max_iterations 计算
+        num_epochs = 35
+        max_iterations = num_epochs * len(train_loader)
+        iter_num = 0
         best_val_dice = 0.0
 
         # 初始化绘图
@@ -238,7 +210,7 @@ def main():
         ax1.set_xlabel('Epochs')
         ax1.set_ylabel('Train Loss', color='tab:red')
         ax2.set_ylabel('Validation Dice', color='tab:blue')
-        plt.title('Baseline Training Progress (TransUNet)')
+        plt.title('Training Progress (MISSFormer - Author Settings)')
         line_loss, = ax1.plot([], [], color='tab:red', marker='o', label='Train Loss')
         line_dice, = ax2.plot([], [], color='tab:blue', marker='s', label='Val Dice')
         ax1.legend([line_loss, line_dice], ['Train Loss', 'Val Dice'], loc='center right')
@@ -249,7 +221,7 @@ def main():
             train_loss_epoch = 0.0
 
             pbar_train = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{num_epochs}] Train", leave=False)
-            for images, masks in pbar_train:
+            for i_batch, (images, masks) in enumerate(pbar_train):
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
                 outputs = model(images)
@@ -257,8 +229,14 @@ def main():
                 loss.backward()
                 optimizer.step()
 
+                # 完全遵循原作者 poly 学习率衰减策略 (每个 iteration 更新一次)
+                lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_
+                iter_num += 1
+
                 train_loss_epoch += loss.item()
-                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}"})
+                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{lr_:.6f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
 
@@ -270,12 +248,10 @@ def main():
                     outputs = model(images)
                     val_dices.extend(calculate_metrics(outputs, masks)["dice"])
 
-
             avg_val_dice = np.mean(val_dices)
-            scheduler.step()
 
             print(
-                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | Current LR: {lr_:.6f}")
 
             # 更新绘图数据
             epochs_list.append(epoch + 1)
@@ -294,21 +270,22 @@ def main():
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
                 torch.save(model.state_dict(), save_path)
-                print(f"🌟 [New Best Baseline Saved] Val Dice: {best_val_dice:.4f}")
+                print(f"🌟 [New Best Model Saved] Val Dice: {best_val_dice:.4f}")
 
             torch.cuda.empty_cache()
             gc.collect()
 
         # 结束绘图
         plt.ioff()
-        plt.savefig('baseline_training_curve.png', dpi=150)
-        print("📈 基线训练曲线已保存为 baseline_training_curve.png")
+        plt.savefig('missformer_author_settings_curve.png', dpi=150)
+        print("📈 训练曲线已保存为 missformer_author_settings_curve.png")
+
     # ==========================================
     # 5. 测试模式 (Test) / 全指标评估
     # ==========================================
     if MODE in ["train", "test"]:
         print("\n" + "=" * 50)
-        print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 Baseline 最终性能...")
+        print("🚀 开始在完全未见的【测试集 (Test Set)】上评估 MISSFormer 最终性能...")
 
         if not os.path.exists(save_path):
             print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
@@ -318,7 +295,7 @@ def main():
 
             test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
             print("🔥 正在进行 GPU 预热 (Warm-up)...")
-            dummy_input = torch.randn(1, 3, 256, 256).to(device)
+            dummy_input = torch.randn(1, 3, 224, 224).to(device)
             with torch.no_grad():
                 for _ in range(10):
                     _ = model(dummy_input)
@@ -351,7 +328,8 @@ def main():
 
             avg_time_per_image = (total_infer_time / total_samples) * 1000
             fps = 1.0 / (total_infer_time / total_samples)
-            print("\n🏆 nnUNet (BUSI dataset)  最终测试集成绩 🏆")
+
+            print("\n🏆  MISSFormer (BUSI dataset) 最终测试集成绩 🏆")
             print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
             print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
             print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
@@ -362,6 +340,7 @@ def main():
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
             print("=" * 50)
+
 
 if __name__ == "__main__":
     main()
