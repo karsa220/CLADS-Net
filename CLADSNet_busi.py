@@ -80,7 +80,7 @@ class MLP(nn.Module):
 class LeakyRCAB(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.LConv = nn.Sequential(
+        self.local_conv = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.LeakyReLU(0.01, inplace=True),
@@ -99,7 +99,7 @@ class LeakyRCAB(nn.Module):
 
     def forward(self, x):
         identity = x
-        feat = self.LConv(x)
+        feat = self.local_conv(x)
         att = self.channel_att(self.gap(feat))
         return feat * att + identity
 
@@ -377,7 +377,7 @@ def main():
 
     avg_time_per_image = (total_infer_time / total_samples) * 1000
     fps = 1.0 / (total_infer_time / total_samples)
-    print("\n🏆 CLADSNet  最终测试集成绩 🏆")
+    print("\n🏆 mynet_Baseline  最终测试集成绩 🏆")
     print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
     print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
     print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
