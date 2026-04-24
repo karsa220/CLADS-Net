@@ -13,13 +13,43 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from transunet.main import HybridLoss
 
-from transattunet.main import TransAttUNet
-from transattunet.main import calculate_metrics
+from main import HybridLoss
+from main import calculate_metrics
 
 # ==========================================
-# 6. UDIAT 数据集加载 (原图/GT结构)
+# 1. 导入官方 SegFormer 并封装 
+# ==========================================
+from transformers import SegformerForSemanticSegmentation
+
+
+class SegFormerWrapper(nn.Module):
+    def __init__(self, pretrained_model="nvidia/mit-b0", num_classes=1):
+        super(SegFormerWrapper, self).__init__()
+        # 加载预训练模型
+        self.model = SegformerForSemanticSegmentation.from_pretrained(
+            pretrained_model,
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True
+        )
+
+    def forward(self, x):
+        outputs = self.model(pixel_values=x)
+        logits = outputs.logits
+
+        # 恢复到原图分辨率 256x256
+        upsampled_logits = F.interpolate(
+            logits,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+        # SegFormer 结合你的 HybridLoss 需要 Sigmoid 输出概率
+        return torch.sigmoid(upsampled_logits)
+
+
+# ==========================================
+# 6. UDIAT 数据集加载 (原图/GT结构) - 保持不变
 # ==========================================
 class UDIATDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -94,9 +124,9 @@ def main():
     MODE = "train"  # "train" 训练(微调) | "test" 直接评估
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
-    # 🚀 修改 1：定义预训练权重和新权重的路径
-    pretrained_busi_path = "best_busi.pth"
-    save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名，加了 finetuned 以示区分
+    # 🚀 修改 1：对应上一份代码中保存的 SegFormer 权重名字
+    pretrained_busi_path = "best_segformer_busi.pth"
+    save_path = "best_segformer_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
@@ -112,16 +142,17 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    model = TransAttUNet().to(device)
+    # 🚀 初始化 SegFormer
+    model = SegFormerWrapper(pretrained_model="nvidia/mit-b0", num_classes=1).to(device)
 
     if MODE == "train":
-        # 🚀 修改 2：在开启训练前，加载 BUSI 的预训练权重
+        # 🚀 尝试加载 BUSI 的预训练权重进行微调
         if os.path.exists(pretrained_busi_path):
             print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
             print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
         else:
-            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！")
+            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从 HuggingFace 初始状态开始训练！")
 
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
         val_loader = DataLoader(
@@ -130,9 +161,9 @@ def main():
 
         criterion = HybridLoss()
 
-        # 🚀 修改 3：降低微调的学习率。从 1e-3 降低到 1e-4 或 5e-5，防止破坏原本学好的特征
-        fine_tune_lr = 1e-4
-        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+        # 🚀 修改 2：更换为 AdamW，使用较小的学习率进行微调
+        fine_tune_lr = 6e-5
+        optimizer = optim.AdamW(model.parameters(), lr=fine_tune_lr, weight_decay=0.01)
 
         num_epochs = 50
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -148,6 +179,7 @@ def main():
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
+
                 outputs = model(images)
                 loss = criterion(outputs, masks)
 
@@ -164,7 +196,6 @@ def main():
             with torch.no_grad():
                 for images, masks in val_loader:
                     out = model(images.to(device))
-                    # 适配你的输出元组形式或单输出形式
                     if isinstance(out, tuple): out = out[0]
                     val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
@@ -178,7 +209,6 @@ def main():
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                # 🚀 修改 4：保存微调后的最佳模型
                 torch.save(model.state_dict(), save_path)
                 print(f"🌟 [New Best Saved] Val Dice: {best_val_dice:.4f} -> Saved to {save_path}")
 
@@ -193,8 +223,8 @@ def main():
         plt.title("Val Dice");
         plt.grid()
         plt.tight_layout()
-        plt.savefig('training_curve_HANet_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_HANet_UDIAT_Finetuned.png")
+        plt.savefig('training_curve_SegFormer_UDIAT_Finetuned.png', dpi=150)
+        print("✅ 训练完成，训练曲线已保存为 training_curve_SegFormer_UDIAT_Finetuned.png")
 
     print("\n" + "=" * 50)
     print("🚀 开始在完全未见的测试集上评估...")
@@ -233,7 +263,7 @@ def main():
             m = calculate_metrics(outputs, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 TransAttnUnet (UDIAT Finetuned) 测试集最终成绩 🏆")
+    print("\n🏆 SegFormer (UDIAT Finetuned) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
@@ -242,6 +272,7 @@ def main():
     print(
         f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()

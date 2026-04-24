@@ -29,7 +29,7 @@ class MISSFormerWrapper(nn.Module):
 
 
 # ==========================================
-# 2. 原作者风格的损失函数与指标计算
+# 2. 修正后的二分类 Loss 与指标计算
 # ==========================================
 class AuthorStyleLoss(nn.Module):
     def __init__(self):
@@ -40,10 +40,11 @@ class AuthorStyleLoss(nn.Module):
         loss_bce = self.bce(pred, target)
         smooth = 1e-5
         intersect = torch.sum(pred * target)
-        y_sum = torch.sum(target * target)
-        z_sum = torch.sum(pred * pred)
-        dice = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+
+        # 🚀 必须修正为标准的二分类 Dice 分母，防止平方导致的梯度消失
+        dice = (2 * intersect + smooth) / (torch.sum(pred) + torch.sum(target) + smooth)
         loss_dice = 1 - dice
+
         return 0.4 * loss_bce + 0.6 * loss_dice
 
 
@@ -56,6 +57,7 @@ def calculate_metrics(pred, target, smooth=1e-5):
     fp = (pred_flat * (1 - target_flat)).sum(dim=1)
     fn = ((1 - pred_flat) * target_flat).sum(dim=1)
     tn = ((1 - pred_flat) * (1 - target_flat)).sum(dim=1)
+
     dice = (2. * tp + smooth) / (2. * tp + fp + fn + smooth)
     iou = (tp + smooth) / (tp + fp + fn + smooth)
     acc = (tp + tn + smooth) / (tp + fp + fn + tn + smooth)
@@ -65,7 +67,7 @@ def calculate_metrics(pred, target, smooth=1e-5):
 
 
 # ==========================================
-# 3. UDIAT 数据集加载 (尺寸与归一化适配 MISSFormer)
+# 3. 数据集加载
 # ==========================================
 class UDIATDataset(Dataset):
     def __init__(self, image_paths, mask_paths, is_train=False):
@@ -78,7 +80,7 @@ class UDIATDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        # 🚀 必须强制修改为 224x224，否则 MISSFormer 的 BridgeLayer 会报错
+        # 强制 224x224
         image = TF.resize(image, (224, 224))
         mask = TF.resize(mask, (224, 224))
 
@@ -97,8 +99,7 @@ class UDIATDataset(Dataset):
 
         image = TF.to_tensor(image)
         mask = TF.to_tensor(mask)
-
-        # 🚀 修改为 MISSFormer 作者所使用的归一化参数
+        # MISSFormer 标准归一化
         image = TF.normalize(image, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
         return image, mask
@@ -133,11 +134,11 @@ def get_udiat_paths(data_dir):
 # ==========================================
 def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
-    MODE = "train"
+    MODE = "train"  # 先设为 train 跑一次
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"
 
-    # 🚀 使用上一步基于 BUSI 训练好的 MISSFormer 权重
     pretrained_busi_path = "best_busi.pth"
+    mit_imagenet_path = "mit_b1.pth"  # ⚠️ 确保此文件在你项目目录下
     save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -147,8 +148,7 @@ def main():
     if not all_imgs: return
 
     combined = list(zip(all_imgs, all_masks))
-    # 使用原作者固定的随机种子
-    random.seed(1234)
+    random.seed(42)
     np.random.seed(1234)
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)
@@ -159,16 +159,26 @@ def main():
     total = len(all_imgs)
     t_size, v_size = int(0.8 * total), int(0.1 * total)
 
-    # 实例化包装后的 MISSFormer
     model = MISSFormerWrapper(n_classes=1).to(device)
 
     if MODE == "train":
+        # 🚀 权重加载逻辑：优先加载 BUSI，没有则回退加载 ImageNet (mit_b1.pth)
         if os.path.exists(pretrained_busi_path):
-            print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
+            print(f"🔄 加载 BUSI 预训练权重: {pretrained_busi_path}")
             model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
-            print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
+        elif os.path.exists(mit_imagenet_path):
+            print(f"🔄 未找到BUSI权重，加载官方 MiT-B1 ImageNet 预训练权重: {mit_imagenet_path}")
+            pretrained_dict = torch.load(mit_imagenet_path, map_location='cpu')
+            model_dict = model.model.backbone.state_dict()
+            new_state_dict = {}
+            for k, v in pretrained_dict.items():
+                new_k = k.replace('backbone.', '').replace('head.', '')
+                if new_k in model_dict and v.size() == model_dict[new_k].size():
+                    new_state_dict[new_k] = v
+            model.model.backbone.load_state_dict(new_state_dict, strict=False)
+            print(f"✅ 成功加载了 {len(new_state_dict)} 个 MiT-B1 张量！")
         else:
-            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头开始训练！")
+            print("⚠️ 警告: 未找到任何预训练权重，模型从头训练，跑分极有可能崩溃！")
 
         train_loader = DataLoader(UDIATDataset(all_imgs[:t_size], all_masks[:t_size], True), batch_size=8, shuffle=True)
         val_loader = DataLoader(
@@ -177,16 +187,25 @@ def main():
 
         criterion = AuthorStyleLoss()
 
+        # 🚀 必须使用差分学习率！Backbone 小学习率，Decoder 大学习率
+        backbone_params = []
+        decoder_params = []
+        for name, param in model.named_parameters():
+            if 'backbone' in name:
+                backbone_params.append(param)
+            else:
+                decoder_params.append(param)
 
-        fine_tune_lr = 1e-4
-        optimizer = optim.AdamW(model.parameters(), lr=fine_tune_lr, weight_decay=1e-4)
+        optimizer = optim.AdamW([
+            {'params': backbone_params, 'lr': 1e-4},  # Backbone 微调
+            {'params': decoder_params, 'lr': 1e-3}  # Decoder 快速学习
+        ], weight_decay=1e-4)
 
         num_epochs = 50
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
-
-
         max_iterations = num_epochs * len(train_loader)
-        iter_num = 0
+
+        # 🚀 余弦退火调度器
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iterations, eta_min=1e-6)
 
         best_val_dice = 0.0
         history_loss, history_val_dice = [], []
@@ -198,21 +217,22 @@ def main():
 
             for images, masks in pbar:
                 images, masks = images.to(device), masks.to(device)
+
                 optimizer.zero_grad()
                 outputs = model(images)
                 loss = criterion(outputs, masks)
-
                 loss.backward()
+
+                # 🚀 梯度裁剪，防止 Transformer 在 1e-3 学习率下梯度爆炸
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optimizer.step()
+                scheduler.step()  # 每个 iter 步进一次
 
-                # 原作者 Poly 学习率调度策略 (逐 iteration 更新)
-                lr_ = fine_tune_lr * (1.0 - iter_num / max_iterations) ** 0.9
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr_
-                iter_num += 1
-
+                # 获取 Decoder 的学习率用于显示
+                current_lr = optimizer.param_groups[1]['lr']
                 train_loss_epoch += loss.item()
-                pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{lr_:.6f}"})
+                pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'LR(Dec)': f"{current_lr:.6f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
 
@@ -225,11 +245,11 @@ def main():
                     val_dices.extend(calculate_metrics(out, masks.to(device))["dice"])
 
             avg_val_dice = np.mean(val_dices)
-
             history_loss.append(avg_train_loss)
             history_val_dice.append(avg_val_dice)
 
-            print(f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | LR: {lr_:.6f}")
+            print(
+                f"📉 Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | Dec LR: {current_lr:.6f}")
 
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
@@ -239,7 +259,7 @@ def main():
             torch.cuda.empty_cache()
             gc.collect()
 
-        # 训练结束后静态绘制曲线图
+        # 绘制训练图表
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1)
         plt.plot(history_loss, marker='o')
@@ -251,53 +271,58 @@ def main():
         plt.grid()
         plt.tight_layout()
         plt.savefig('training_curve_MISSFormer_UDIAT_Finetuned.png', dpi=150)
-        print("✅ 训练完成，训练曲线已保存为 training_curve_MISSFormer_UDIAT_Finetuned.png")
+        print("✅ 训练完成，图表已保存。")
 
-    print("\n" + "=" * 50)
-    print("🚀 开始在完全未见的测试集上评估...")
-    test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
-                             batch_size=1, shuffle=False)
+    # ==========================================
+    # 5. 测试模式 (Test)
+    # ==========================================
+    if MODE in ["train", "test"]:
+        test_loader = DataLoader(UDIATDataset(all_imgs[t_size + v_size:], all_masks[t_size + v_size:], False),
+                                 batch_size=1, shuffle=False)
+        print("\n" + "=" * 50)
+        print("🚀 开始在完全未见的【测试集】上评估 MISSFormer...")
 
-    if not os.path.exists(save_path):
-        print(f"❌ 找不到权重文件 {save_path}！请先运行 train 模式。")
-        return
+        if not os.path.exists(save_path):
+            print(f"❌ 找不到权重 {save_path}！请先运行 train。")
+        else:
+            model.load_state_dict(torch.load(save_path, map_location=device))
+            model.eval()
 
-    model.load_state_dict(torch.load(save_path, map_location=device))
-    model.eval()
-
-    print("🔥 GPU 预热 (Warm-up)...")
-    with torch.no_grad():
-        # 预热尺寸也必须修改为 224x224
-        for _ in range(5): model(torch.randn(1, 3, 224, 224).to(device))
-    if torch.cuda.is_available(): torch.cuda.synchronize()
-
-    test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
-    total_time, total_samples = 0.0, 0
-
-    with torch.no_grad():
-        for images, masks in tqdm(test_loader, desc="Testing"):
-            images, masks = images.to(device), masks.to(device)
-
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t0 = time.time()
-            outputs = model(images)
+            test_res = {"dice": [], "iou": [], "acc": [], "pre": [], "rec": []}
+            print("🔥 GPU 预热 (Warm-up)...")
+            with torch.no_grad():
+                for _ in range(5): model(torch.randn(1, 3, 224, 224).to(device))
             if torch.cuda.is_available(): torch.cuda.synchronize()
 
-            total_time += (time.time() - t0)
-            total_samples += images.size(0)
+            total_infer_time, total_samples = 0.0, 0
 
-            m = calculate_metrics(outputs, masks)
-            for k in test_res: test_res[k].extend(m[k])
+            with torch.no_grad():
+                for images, masks in tqdm(test_loader, desc="Testing"):
+                    images, masks = images.to(device), masks.to(device)
 
-    print("\n🏆 MISSFormer (UDIAT Finetuned) 测试集最终成绩 🏆")
-    print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
-    print(
-        f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
-    print("-" * 50)
-    print(f"⚡ 推理速度评估 (Device: {device}) ⚡")
-    print(
-        f"⏱️ 平均耗时: {(total_time / total_samples) * 1000:.2f} ms/img | FPS: {1.0 / (total_time / total_samples):.2f}")
-    print("=" * 50)
+                    if torch.cuda.is_available(): torch.cuda.synchronize()
+                    start_time = time.time()
+                    outputs = model(images)
+                    if torch.cuda.is_available(): torch.cuda.synchronize()
+
+                    total_infer_time += (time.time() - start_time)
+                    total_samples += images.size(0)
+
+                    metrics = calculate_metrics(outputs, masks)
+                    for k in test_res.keys(): test_res[k].extend(metrics[k])
+
+            avg_time_per_image = (total_infer_time / total_samples) * 1000
+            fps = 1.0 / (total_infer_time / total_samples)
+
+            print("\n🏆 MISSFormer (UDIAT Finetuned) 测试集最终成绩 🏆")
+            print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
+            print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
+            print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")
+            print(f"🔹 Precision: {np.mean(test_res['pre']):.4f}")
+            print(f"🔹 Recall   : {np.mean(test_res['rec']):.4f}")
+            print("-" * 50)
+            print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms/img | FPS: {fps:.2f}")
+            print("=" * 50)
 
 
 if __name__ == "__main__":

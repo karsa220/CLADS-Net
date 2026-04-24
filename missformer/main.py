@@ -58,8 +58,9 @@ class AuthorStyleLoss(nn.Module):
         smooth = 1e-5
         intersect = torch.sum(pred * target)
         y_sum = torch.sum(target * target)
-        z_sum = torch.sum(pred * pred)
-        dice = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+        # 将原作者的 z_sum = torch.sum(pred * pred) 替换为标准的：
+        dice = (2 * intersect + smooth) / (torch.sum(pred) + torch.sum(target) + smooth)
+
         loss_dice = 1 - dice
 
         # 原作者组合比例
@@ -158,7 +159,7 @@ def main():
         exit()
 
     combined = list(zip(all_imgs, all_masks))
-    random.seed(1234)  # 采用原作者设定的随机种子
+    random.seed(42)
     np.random.seed(1234)
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)
@@ -186,22 +187,71 @@ def main():
     # ==========================================
     # 3. 初始化 MISSFormer
     # ==========================================
+    # ==========================================
+    # 3. 初始化 MISSFormer
+    # ==========================================
     model = MISSFormerWrapper(n_classes=1).to(device)
+
+    # ==========================================
+    # [新增] 3.5 加载 MiT-B1 ImageNet 预训练权重
+    # ==========================================
+    pretrained_path = r"./mit_b1.pth"  # ⚠️ 改成你实际下载的路径
+
+    if os.path.exists(pretrained_path):
+        print(f"🚀 正在加载 MiT Backbone 预训练权重: {pretrained_path}")
+        pretrained_dict = torch.load(pretrained_path, map_location='cpu')
+
+        # 处理官方权重字典的键名兼容性
+        # 官方权重的 key 可能带有 "backbone." 或 "default." 前缀，这里做简单清洗
+        model_dict = model.model.backbone.state_dict()
+        new_state_dict = {}
+        for k, v in pretrained_dict.items():
+            # 去除可能存在的前缀干扰，匹配当前 backbone 的 key
+            new_k = k.replace('backbone.', '').replace('head.', '')
+            if new_k in model_dict and v.size() == model_dict[new_k].size():
+                new_state_dict[new_k] = v
+
+        # 将清洗后的权重加载到 MISSFormer 的 backbone 中 (strict=False 防止非关键层报错)
+        model.model.backbone.load_state_dict(new_state_dict, strict=False)
+        print(f"✅ 成功加载了 {len(new_state_dict)} 个预训练张量！")
+    else:
+        print("⚠️ 警告：未找到预训练权重！模型将从头开始训练 (Train from scratch)，性能可能会非常差！")
+
     criterion = AuthorStyleLoss()
 
     # ==========================================
     # 4. 训练模式 (Train)
     # ==========================================
+    # ==========================================
+    # 4. 训练模式 (Train) - 针对 35 Epoch 的极速收敛策略
+    # ==========================================
     if MODE == "train":
-        # 遵循原作者的优化器设置：SGD, lr=0.05, momentum=0.9, weight_decay=0.0001
-        base_lr = 0.05
-        optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
-
-        # 遵循原作者的 Epoch 设置与 poly lr max_iterations 计算
         num_epochs = 35
-        max_iterations = num_epochs * len(train_loader)
-        iter_num = 0
         best_val_dice = 0.0
+
+        # ---------------------------------------------------------
+        # 修改 1 & 2: 分离参数并使用 AdamW + 差分学习率
+        # ---------------------------------------------------------
+        backbone_params = []
+        decoder_params = []
+        for name, param in model.named_parameters():
+            if 'backbone' in name:
+                backbone_params.append(param)
+            else:
+                decoder_params.append(param)
+
+        # Backbone 采用较小学习率(1e-4)微调，Decoder 采用较大学习率(1e-3)快速学习
+        optimizer = optim.AdamW([
+            {'params': backbone_params, 'lr': 1e-4},
+            {'params': decoder_params, 'lr': 1e-3}
+        ], weight_decay=1e-4)
+
+        # ---------------------------------------------------------
+        # 修改 3: 使用余弦退火学习率策略 (Cosine Annealing)
+        # ---------------------------------------------------------
+        # T_max 设为总 iterations 数，让学习率在 35 epoch 内呈余弦曲线平滑下降至 eta_min
+        max_iterations = num_epochs * len(train_loader)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iterations, eta_min=1e-6)
 
         # 初始化绘图
         plt.ion()
@@ -210,7 +260,7 @@ def main():
         ax1.set_xlabel('Epochs')
         ax1.set_ylabel('Train Loss', color='tab:red')
         ax2.set_ylabel('Validation Dice', color='tab:blue')
-        plt.title('Training Progress (MISSFormer - Author Settings)')
+        plt.title('Training Progress (AdamW + Cosine LR for 35 Epochs)')
         line_loss, = ax1.plot([], [], color='tab:red', marker='o', label='Train Loss')
         line_dice, = ax2.plot([], [], color='tab:blue', marker='s', label='Val Dice')
         ax1.legend([line_loss, line_dice], ['Train Loss', 'Val Dice'], loc='center right')
@@ -227,18 +277,24 @@ def main():
                 outputs = model(images)
                 loss = criterion(outputs, masks)
                 loss.backward()
+
+                # 可选：加入梯度裁剪防止梯度爆炸
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optimizer.step()
 
-                # 完全遵循原作者 poly 学习率衰减策略 (每个 iteration 更新一次)
-                lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr_
-                iter_num += 1
+                # 每个 iteration 更新一次学习率
+                scheduler.step()
+
+                # 获取当前 Decoder 的学习率用于打印展示
+                current_lr = optimizer.param_groups[1]['lr']
 
                 train_loss_epoch += loss.item()
-                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{lr_:.6f}"})
+                pbar_train.set_postfix({'Loss': f"{loss.item():.4f}", 'LR(Dec)': f"{current_lr:.6f}"})
 
             avg_train_loss = train_loss_epoch / len(train_loader)
+
+            # ... [之后的评估验证代码保持不变] ...
 
             model.eval()
             val_dices = []
@@ -251,7 +307,7 @@ def main():
             avg_val_dice = np.mean(val_dices)
 
             print(
-                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | Current LR: {lr_:.6f}")
+                f"📉 Epoch {epoch + 1} | Avg Train Loss: {avg_train_loss:.4f} | Val Dice: {avg_val_dice:.4f} | Current LR: {current_lr:.6f}")
 
             # 更新绘图数据
             epochs_list.append(epoch + 1)
