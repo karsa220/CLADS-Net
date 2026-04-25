@@ -80,7 +80,7 @@ class MLP(nn.Module):
 class LeakyRCAB(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.local_conv = nn.Sequential(
+        self.LConv = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.LeakyReLU(0.01, inplace=True),
@@ -99,7 +99,7 @@ class LeakyRCAB(nn.Module):
 
     def forward(self, x):
         identity = x
-        feat = self.local_conv(x)
+        feat = self.LConv(x)
         att = self.channel_att(self.gap(feat))
         return feat * att + identity
 
@@ -124,7 +124,7 @@ class CLADS_Net(nn.Module):
         self.linear4 = MLP(self.ch4, embed_dim)
         self.linear_b = MLP(self.ch_b, embed_dim)
 
-
+        # --- 换成这个 ---
         self.csma_fuse = CrossScaleMLPAttention(channels=embed_dim, num_scales=5, reduction=4)
 
         # final_conv 保持不变，用于将 embed_dim 降维到 1 用于分割
@@ -252,7 +252,7 @@ def get_dataset_paths(data_dir):
 
 def main():
     MODE = "train"
-    save_path = "best_BUSI.pth"
+    save_path = "best_busi.pth"
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"  # 请根据实际修改
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -282,7 +282,7 @@ def main():
 
         criterion = HybridLoss()
         optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)  # MLP 适合用 AdamW
-        num_epochs = 15
+        num_epochs = 35
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -304,7 +304,7 @@ def main():
                         0.4 * criterion(out4, masks)
                 )
 
-                loss = loss_main + 0.4 * loss_aux
+                loss = loss_main +  loss_aux
 
                 loss.backward()
                 optimizer.step()
@@ -377,7 +377,7 @@ def main():
 
     avg_time_per_image = (total_infer_time / total_samples) * 1000
     fps = 1.0 / (total_infer_time / total_samples)
-    print("\n🏆 clads  最终测试集成绩 🏆")
+    print("\n🏆 mynet_Baseline  最终测试集成绩 🏆")
     print(f"🔹 Dice     : {np.mean(test_res['dice']):.4f}")
     print(f"🔹 IoU      : {np.mean(test_res['iou']):.4f}")
     print(f"🔹 ACC      : {np.mean(test_res['acc']):.4f}")

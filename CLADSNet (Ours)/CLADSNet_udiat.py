@@ -91,7 +91,8 @@ def main():
     MODE = "train"  # "train" 训练 | "test" 直接评估
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
     save_path = "best_UDIAT_finetuned.pth"
-
+    # 🚀 修改 1：对应上一份脚本在 BUSI 上的最佳权重名
+    pretrained_busi_path = "best_busi.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")
 
@@ -113,10 +114,17 @@ def main():
         val_loader = DataLoader(
             UDIATDataset(all_imgs[t_size:t_size + v_size], all_masks[t_size:t_size + v_size], False), batch_size=8,
             shuffle=False)
+        # 🚀 修改 3：加载 BUSI 上的最佳 CMU-Net 权重进行微调
+        if os.path.exists(pretrained_busi_path):
+            print(f"🔄 正在加载 BUSI 预训练权重: {pretrained_busi_path}")
+            model.load_state_dict(torch.load(pretrained_busi_path, map_location=device))
+            print("✅ 预训练权重加载成功！开始基于 BUSI 先验知识进行微调 (Fine-tuning)。")
+        else:
+            print(f"⚠️ 警告: 未找到预训练权重 '{pretrained_busi_path}'，模型将从头初始化！")
 
         criterion = HybridLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)  # MLP 适合用 AdamW
-        num_epochs = 15
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)  # MLP 适合用 AdamW
+        num_epochs = 50
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -200,7 +208,7 @@ def main():
             m = calculate_metrics(outputs, masks)
             for k in test_res: test_res[k].extend(m[k])
 
-    print("\n🏆 clads (UDIAT) 测试集最终成绩 🏆")
+    print("\n🏆 CLADSNet (UDIAT) 测试集最终成绩 🏆")
     print(f"🔹 Dice : {np.mean(test_res['dice']):.4f} | IoU: {np.mean(test_res['iou']):.4f}")
     print(
         f"🔹 ACC  : {np.mean(test_res['acc']):.4f}  | Pre: {np.mean(test_res['pre']):.4f} | Rec: {np.mean(test_res['rec']):.4f}")
