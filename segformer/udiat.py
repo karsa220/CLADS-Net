@@ -125,8 +125,8 @@ def main():
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
     # 🚀 修改 1：对应上一份代码中保存的 SegFormer 权重名字
-    pretrained_busi_path = "best_segformer_busi.pth"
-    save_path = "best_segformer_UDIAT_finetuned.pth"
+    pretrained_busi_path = "best_busi.pth"
+    save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")

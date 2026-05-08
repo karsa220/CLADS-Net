@@ -284,10 +284,10 @@ def main():
 
     # 🎯 定义消融实验配置字典
     ablation_configs = {
-        # 2. 单模块有效性验证 (加法逻辑：开一关二)
-        "2. + RCAB Only": {"use_rcab": True, "use_csma": False, "use_deep_sup": False},
-        "3. + CSMA Only": {"use_rcab": False, "use_csma": True, "use_deep_sup": False},
-        "4. + Deep Sup. Only": {"use_rcab": False, "use_csma": False, "use_deep_sup": True},
+
+        " RCAB Only": {"use_rcab": True, "use_csma": False, "use_deep_sup": False},
+        "CSMA Only": {"use_rcab": False, "use_csma": True, "use_deep_sup": False},
+        "Deep Sup. Only": {"use_rcab": False, "use_csma": False, "use_deep_sup": True},
 
        "w/o CSMA (No Cross-Scale Attn)": {"use_rcab": True, "use_csma": False, "use_deep_sup": True},
       "w/o RCAB (No Channel Attn)": {"use_rcab": False, "use_csma": True, "use_deep_sup": True},
@@ -296,7 +296,7 @@ def main():
     }
 
     results = {}
-    num_epochs = 15
+    num_epochs = 35
     criterion = HybridLoss()
 
     for config_name, kwargs in ablation_configs.items():

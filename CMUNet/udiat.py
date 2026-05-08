@@ -117,7 +117,7 @@ def main():
 
     # 🚀 修改 1：对应上一份脚本在 BUSI 上的最佳权重名
     pretrained_busi_path = "best_busi.pth"
-    save_path = "best_CMUNet_UDIAT_finetuned.pth"
+    save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Device: {device} | ⚙️ Mode: {MODE}")

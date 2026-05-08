@@ -143,7 +143,7 @@ def get_dataset_paths(data_dir):
 def main():
     # 1. 运行模式设置
     MODE = "train"
-    save_path = "best_segformer_busi.pth"  # 更新权重名字
+    save_path = "best_busi.pth"  # 更新权重名字
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

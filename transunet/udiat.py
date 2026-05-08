@@ -121,7 +121,7 @@ def main():
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
     # 🚀 定义预训练权重和新权重的路径
-    pretrained_busi_path = "best_busi_official.pth"  # 确保这里加载的是用官方代码训练出来的 BUSI 权重
+    pretrained_busi_path = "best_busi.pth"  # 确保这里加载的是用官方代码训练出来的 BUSI 权重
     save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

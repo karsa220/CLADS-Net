@@ -92,7 +92,7 @@ def main():
     # ==========================================
     # 1. 运行模式设置
     # ==========================================
-    MODE = "train"  # 可选: "train" 或 "test"
+    MODE = "test"  # 可选: "train" 或 "test"
     save_path = "best_busi.pth"  # 更新了权重文件名称
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"

@@ -64,17 +64,7 @@ class CrossScaleMLPAttention(nn.Module):
         fused_out = (stacked_f * attn_weights).sum(dim=1)
 
         return fused_out
-class MLP(nn.Module):
-    def __init__(self, input_dim, embed_dim):
-        super().__init__()
-        self.proj = nn.Linear(input_dim, embed_dim)
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        x = self.proj(x)
-        x = x.transpose(1, 2).reshape(B, -1, H, W)
-        return x
 
 #(Leaky Residual Channel Attention Block)
 class LeakyRCAB(nn.Module):
@@ -103,35 +93,49 @@ class LeakyRCAB(nn.Module):
         att = self.channel_att(self.gap(feat))
         return feat * att + identity
 
+
+
+
+# 负责统一通道维度的投影层
+class ChannelAdapter(nn.Module):
+    def __init__(self, input_dim, embed_dim):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, embed_dim)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = self.proj(x)
+        x = x.transpose(1, 2).reshape(B, -1, H, W)
+        return x
+
 # (Cross-scale Leaky Attention with Deep Supervision)
+# 带有深度监督的跨尺度网络
 class CLADS_Net(nn.Module):
     def __init__(self, embed_dim=256):
         super().__init__()
-
         densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
         self.encoder = densenet.features
 
-        self.ch0, self.ch2, self.ch3 = 64, 256, 512
-        self.ch4, self.ch_b = 1024, 1024
+        self.ch0, self.ch2, self.ch3, self.ch4, self.ch_b = 64, 256, 512, 1024, 1024
 
+        # 局部通道注意力
         self.rcab2 = LeakyRCAB(self.ch2)
         self.rcab3 = LeakyRCAB(self.ch3)
         self.rcab4 = LeakyRCAB(self.ch4)
 
-        self.linear0 = MLP(self.ch0, embed_dim)
-        self.linear2 = MLP(self.ch2, embed_dim)
-        self.linear3 = MLP(self.ch3, embed_dim)
-        self.linear4 = MLP(self.ch4, embed_dim)
-        self.linear_b = MLP(self.ch_b, embed_dim)
+        # 特征对齐到 embed_dim，这里的线性投影简称linear
+        self.linear0 = ChannelAdapter(self.ch0, embed_dim)
+        self.linear2 = ChannelAdapter(self.ch2, embed_dim)
+        self.linear3 = ChannelAdapter(self.ch3, embed_dim)
+        self.linear4 = ChannelAdapter(self.ch4, embed_dim)
+        self.linear_b = ChannelAdapter(self.ch_b, embed_dim)
 
-        # --- 换成这个 ---
+        # 核心跨尺度融合
         self.csma_fuse = CrossScaleMLPAttention(channels=embed_dim, num_scales=5, reduction=4)
 
-        # final_conv 保持不变，用于将 embed_dim 降维到 1 用于分割
+        # 预测与深度监督
         self.final_conv = nn.Conv2d(embed_dim, 1, 1)
-
-        self.final_conv = nn.Conv2d(embed_dim, 1, 1)
-
         self.aux0 = nn.Conv2d(embed_dim, 1, 1)
         self.aux2 = nn.Conv2d(embed_dim, 1, 1)
         self.aux3 = nn.Conv2d(embed_dim, 1, 1)
@@ -162,7 +166,6 @@ class CLADS_Net(nn.Module):
 
         out = torch.sigmoid(
             F.interpolate(self.final_conv(fused), size=x.shape[2:], mode='bilinear', align_corners=False))
-
 
         if self.training:
             out0 = torch.sigmoid(F.interpolate(self.aux0(l0), size=x.shape[2:], mode='bilinear', align_corners=False))
@@ -251,12 +254,12 @@ def get_dataset_paths(data_dir):
 
 
 def main():
-    MODE = "train"
+    MODE = "test"
     save_path = "best_busi.pth"
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"  # 请根据实际修改
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Using device: {device} | 📐 Architecture: HANet-MLP")
+    print(f"🚀 Using device: {device} | 📐 Architecture: CLADS-net")
 
     all_imgs, all_masks = get_dataset_paths(data_dir)
     total_size = len(all_imgs)
