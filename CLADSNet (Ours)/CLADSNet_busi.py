@@ -12,6 +12,33 @@ from torchvision import models
 import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
+#(Leaky Residual Channel Attention Block)
+class LeakyRCAB(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.LConv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.LeakyReLU(0.01, inplace=True),
+        )
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        mid = max(in_channels // 4, 1)
+        self.channel_att = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 1),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Conv2d(mid, in_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        identity = x
+        feat = self.LConv(x)
+        att = self.channel_att(self.gap(feat))
+        return feat * att + identity
+
 
 
 class CrossScaleMLPAttention(nn.Module):
@@ -65,33 +92,6 @@ class CrossScaleMLPAttention(nn.Module):
 
         return fused_out
 
-
-#(Leaky Residual Channel Attention Block)
-class LeakyRCAB(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.LConv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels),
-            nn.LeakyReLU(0.01, inplace=True),
-        )
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        mid = max(in_channels // 4, 1)
-        self.channel_att = nn.Sequential(
-            nn.Conv2d(in_channels, mid, 1),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv2d(mid, in_channels, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        identity = x
-        feat = self.LConv(x)
-        att = self.channel_att(self.gap(feat))
-        return feat * att + identity
 
 
 
@@ -169,10 +169,10 @@ class CLADS_Net(nn.Module):
 
         if self.training:
             out0 = torch.sigmoid(F.interpolate(self.aux0(l0), size=x.shape[2:], mode='bilinear', align_corners=False))
-            out2 = torch.sigmoid(F.interpolate(self.aux2(l2), size=x.shape[2:], mode='bilinear', align_corners=False))
-            out3 = torch.sigmoid(F.interpolate(self.aux3(lb), size=x.shape[2:], mode='bilinear', align_corners=False))
-            out4 = torch.sigmoid(F.interpolate(self.aux4(l4), size=x.shape[2:], mode='bilinear', align_corners=False))
-            return out, out0, out2, out3, out4
+            out1 = torch.sigmoid(F.interpolate(self.aux2(l2), size=x.shape[2:], mode='bilinear', align_corners=False))
+            out2 = torch.sigmoid(F.interpolate(self.aux3(lb), size=x.shape[2:], mode='bilinear', align_corners=False))
+            out3 = torch.sigmoid(F.interpolate(self.aux4(l4), size=x.shape[2:], mode='bilinear', align_corners=False))
+            return out, out0, out1, out2, out3
         return out
 class HybridLoss(nn.Module):
     def __init__(self, weight_bce=0.4, weight_dice=0.6):

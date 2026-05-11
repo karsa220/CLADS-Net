@@ -137,13 +137,13 @@ def main():
                 optimizer.zero_grad()
 
                 # 新的输出结构
-                out, out0, out2, out3,out4 = model(images)
+                out, out0, out1, out2,out3 = model(images)
                 loss_main = criterion(out, masks)
                 loss_aux = (
                         0.4 * criterion(out0, masks) +
-                        0.4 * criterion(out2, masks) +
-                        0.4 * criterion(out3, masks)+
-                        0.4 * criterion(out4, masks)
+                        0.4 * criterion(out1, masks) +
+                        0.4 * criterion(out2, masks)+
+                        0.4 * criterion(out3, masks)
                 )
 
                 loss = loss_main + loss_aux * 0.4
