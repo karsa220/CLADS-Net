@@ -1,8 +1,8 @@
 import torch.nn as nn
 from einops.layers.torch import Rearrange
 
-from models.Encoder import All2Cross
-from models.Decoder import ConvUpsample, SegmentationHead
+from .Encoder import All2Cross
+from .Decoder import ConvUpsample, SegmentationHead
 
 
 class HiFormer(nn.Module):

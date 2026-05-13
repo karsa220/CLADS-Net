@@ -137,6 +137,7 @@ def get_dataset_paths(data_dir):
     return image_paths, mask_paths
 
 
+
 # ==========================================
 # 4. 主控台
 # ==========================================
@@ -148,6 +149,7 @@ def main():
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
+    model = SegFormerWrapper(pretrained_model="nvidia/mit-b0", num_classes=1).to(device)
 
     # 2. 数据集加载与划分
     all_imgs, all_masks = get_dataset_paths(data_dir)
@@ -181,14 +183,13 @@ def main():
 
     # 3. 初始化官方 SegFormer 模型
     # 如果想用更好的版本，把 nvidia/mit-b0 换成 nvidia/mit-b2 或 b3
-    model = SegFormerWrapper(pretrained_model="nvidia/mit-b0", num_classes=1).to(device)
     criterion = HybridLoss()
 
     # 4. 训练模式
     if MODE == "train":
         # ⚠️ SegFormer 训练设置: Transformer 更适合 AdamW 优化器，且需要较小的学习率
         optimizer = optim.AdamW(model.parameters(), lr=6e-5, weight_decay=0.01)
-        num_epochs = 35
+        num_epochs = 1
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -269,6 +270,7 @@ def main():
 
         if not os.path.exists(save_path):
             print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
+            return None
         else:
             model.load_state_dict(torch.load(save_path, map_location=device))
             model.eval()
@@ -320,7 +322,7 @@ def main():
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
             print("=" * 50)
-
+    return test_res
 
 if __name__ == "__main__":
     main()

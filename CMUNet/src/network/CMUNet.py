@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from src.network.msag import MSAG
+from .msag import MSAG
 
 
 class Residual(nn.Module):

@@ -96,6 +96,7 @@ def get_dataset_paths(data_dir):
     return image_paths, mask_paths
 
 
+
 # ==========================================
 # 4. 主控台
 # ==========================================
@@ -106,7 +107,16 @@ def main():
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
-
+    # ==========================================
+    # 🌟 替换部分：初始化官方 SMP 结构的 UNet++ 模型
+    # ==========================================
+    model = smp.UnetPlusPlus(
+        encoder_name="resnet34",  # 选择编码器架构 (可替换为 mobilenet_v2, efficientnet-b3 等)
+        encoder_weights="imagenet",  # 使用 ImageNet 预训练权重加速收敛
+        in_channels=3,  # 输入通道数 (RGB图像为3)
+        classes=1,  # 输出类别数 (二分类为1)
+        activation="sigmoid"  # 直接输出概率分布，完美兼容下方的 BCELoss
+    ).to(device)
     all_imgs, all_masks = get_dataset_paths(data_dir)
     total_size = len(all_imgs)
     if total_size == 0:
@@ -135,16 +145,6 @@ def main():
 
     print(f"✅ 数据加载完毕 | Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
 
-    # ==========================================
-    # 🌟 替换部分：初始化官方 SMP 结构的 UNet++ 模型
-    # ==========================================
-    model = smp.UnetPlusPlus(
-        encoder_name="resnet34",        # 选择编码器架构 (可替换为 mobilenet_v2, efficientnet-b3 等)
-        encoder_weights="imagenet",     # 使用 ImageNet 预训练权重加速收敛
-        in_channels=3,                  # 输入通道数 (RGB图像为3)
-        classes=1,                      # 输出类别数 (二分类为1)
-        activation="sigmoid"            # 直接输出概率分布，完美兼容下方的 BCELoss
-    ).to(device)
 
     criterion = HybridLoss()
 
@@ -153,7 +153,7 @@ def main():
     # ==========================================
     if MODE == "train":
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 35
+        num_epochs = 1
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -285,6 +285,6 @@ def main():
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
             print("=" * 50)
-
+    return test_res
 if __name__ == "__main__":
     main()

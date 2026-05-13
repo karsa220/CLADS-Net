@@ -92,7 +92,7 @@ def main():
     # ==========================================
     # 1. 运行模式设置
     # ==========================================
-    MODE = "test"  # 可选: "train" 或 "test"
+    MODE = "train"  # 可选: "train" 或 "test"
     save_path = "best_busi.pth"  # 更新了权重文件名称
 
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
@@ -140,8 +140,8 @@ def main():
     # 4. 训练模式 (Train)
     # ==========================================
     if MODE == "train":
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 35
+        optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        num_epochs = 1
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -229,6 +229,7 @@ def main():
 
         if not os.path.exists(save_path):
             print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
+            return None
         else:
             model.load_state_dict(torch.load(save_path, map_location=device))
             model.eval()
@@ -282,7 +283,7 @@ def main():
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
             print("=" * 50)
-
+    return test_res
 
 if __name__ == "__main__":
     main()

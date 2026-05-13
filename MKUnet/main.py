@@ -16,9 +16,9 @@ import matplotlib.pyplot as plt
 # 1. 核心导入：直接使用官方的模块
 # ==========================================
 # 导入官方 MK-UNet 模型
-from mkunet_network import MK_UNet
+from .mkunet_network import MK_UNet
 # 导入官方针对医学分割设计的加权结构损失函数
-from train_polyp import structure_loss
+from .train_polyp import structure_loss
 
 
 # ==========================================
@@ -62,7 +62,7 @@ class BUSIDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert('RGB')
         mask = Image.open(self.mask_paths[idx]).convert('L')
 
-        # 官方代码默认使用 352x352 或者是 256x256，这里保留你的 256
+
         image = TF.resize(image, (256, 256))
         mask = TF.resize(mask, (256, 256))
 
@@ -146,7 +146,7 @@ def main():
     if MODE == "train":
         # 官方代码中默认的学习率是 0.0005，使用 AdamW
         optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-        num_epochs = 35
+        num_epochs = 1
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -239,6 +239,7 @@ def main():
 
         if not os.path.exists(save_path):
             print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
+            return None
         else:
             model.load_state_dict(torch.load(save_path, map_location=device))
             model.eval()

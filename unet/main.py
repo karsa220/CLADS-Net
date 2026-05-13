@@ -264,7 +264,7 @@ def main():
     # ==========================================
     if MODE == "train":
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        num_epochs = 35
+        num_epochs = 1
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -402,7 +402,7 @@ def main():
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
             print("=" * 50)
-
+    return test_res
 
 if __name__ == "__main__":
     main()

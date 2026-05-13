@@ -226,7 +226,7 @@ def main():
     # 4. 训练模式 (Train) - 针对 35 Epoch 的极速收敛策略
     # ==========================================
     if MODE == "train":
-        num_epochs = 35
+        num_epochs = 1
         best_val_dice = 0.0
 
         # ---------------------------------------------------------
@@ -345,6 +345,7 @@ def main():
 
         if not os.path.exists(save_path):
             print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
+            return None
         else:
             model.load_state_dict(torch.load(save_path, map_location=device))
             model.eval()
@@ -396,7 +397,7 @@ def main():
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
             print("=" * 50)
-
+    return test_res
 
 if __name__ == "__main__":
     main()

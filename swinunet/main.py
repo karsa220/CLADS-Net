@@ -17,8 +17,8 @@ import argparse
 # 1. 导入官方的 config 和 Swin-Unet 模型
 # 请确保 config.py, networks 文件夹和 configs 文件夹在当前目录下
 # ==========================================
-from config import get_config
-from networks.vision_transformer import SwinUnet as ViT_seg
+from .config import get_config
+from .networks.vision_transformer import SwinUnet as ViT_seg
 
 
 # ==========================================
@@ -202,7 +202,7 @@ def main():
         # 根据 batch size，通常基础学习率在 0.01 到 0.05 之间，这里使用 default=0.01
         base_lr = 0.01
         optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
-        num_epochs = 35
+        num_epochs = 1
 
         # 官方使用的按 iteration 更新的 poly decay，无需 pytorch 自带的 Scheduler
         iter_num = 0
@@ -341,7 +341,7 @@ def main():
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
             print("=" * 50)
-
+    return test_res
 
 if __name__ == "__main__":
     main()

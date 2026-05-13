@@ -174,7 +174,7 @@ def main():
     MODE = "train"
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"
 
-    pretrained_busi_path = "best_busi.pth"
+    pretrained_busi_path = "best_busi35.pth"
     save_path = "best_UDIAT_finetuned.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

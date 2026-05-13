@@ -158,7 +158,7 @@ def main():
         base_lr = 0.01
         optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
-        num_epochs = 35
+        num_epochs = 1
         max_iterations = num_epochs * len(train_loader)
         iter_num = 0
         best_val_dice = 0.0
@@ -298,7 +298,7 @@ def main():
             print("-" * 50)
             print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
             print(f"🚀 F P S    : {fps:.2f} frames / second")
-
+    return test_res
 
 if __name__ == "__main__":
     main()

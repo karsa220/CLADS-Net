@@ -137,7 +137,7 @@ def main():
     MODE = "train"  # 先设为 train 跑一次
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"
 
-    pretrained_busi_path = "best_busi.pth"
+    pretrained_busi_path = "best_busi35.pth"
     mit_imagenet_path = "mit_b1.pth"  # ⚠️ 确保此文件在你项目目录下
     save_path = "best_UDIAT_finetuned.pth"
 

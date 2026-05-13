@@ -254,7 +254,7 @@ def get_dataset_paths(data_dir):
 
 
 def main():
-    MODE = "test"
+    MODE = "train"
     save_path = "best_busi.pth"
     data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"  # 请根据实际修改
 
@@ -285,7 +285,7 @@ def main():
 
         criterion = HybridLoss()
         optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)  # MLP 适合用 AdamW
-        num_epochs = 35
+        num_epochs = 1
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
         best_val_dice = 0.0
@@ -340,7 +340,7 @@ def main():
 
     if not os.path.exists(save_path):
         print(f"❌ 找不到权重文件: {save_path}！请先运行 train 模式训练。")
-        return
+        return None
 
     model.load_state_dict(torch.load(save_path, map_location=device))
     model.eval()
@@ -391,6 +391,6 @@ def main():
     print(f"⏱️ 平均耗时 : {avg_time_per_image:.2f} ms / image")
     print(f"🚀 F P S    : {fps:.2f} frames / second")
     print("=" * 50)
-
+    return test_res
 if __name__ == "__main__":
     main()

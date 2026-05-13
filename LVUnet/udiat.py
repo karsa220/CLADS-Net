@@ -101,7 +101,7 @@ def main():
     data_dir = r"D:\PycharmProjects\data\UDIAT_Dataset_B"  # 你的 UDIAT 数据集根目录
 
     # 🚀 修改 1：对应上一份代码，读取 LV-UNet 在 BUSI 上的预训练权重
-    pretrained_busi_path = "best_busi.pth"
+    pretrained_busi_path = "best_busi35.pth"
     save_path = "best_UDIAT_finetuned.pth"  # 微调后保存的新权重名
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
