@@ -145,7 +145,7 @@ def main():
     MODE = "train"  # 可选: "train" 或 "test"
     save_path = "best_busi_missformer.pth"
 
-    data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
+    data_dir = r"../data/Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
 

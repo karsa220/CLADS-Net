@@ -104,7 +104,7 @@ def main():
     # 🌟🌟🌟 控制面板 🌟🌟🌟
     MODE = "train"
 
-    data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
+    data_dir = r"../data/Dataset_BUSI_with_GT"
     save_path = "best_busi.pth"
     plot_save_path = "training_curve.png"
 
