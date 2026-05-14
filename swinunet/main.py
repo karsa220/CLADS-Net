@@ -17,8 +17,8 @@ import argparse
 # 1. 导入官方的 config 和 Swin-Unet 模型
 # 请确保 config.py, networks 文件夹和 configs 文件夹在当前目录下
 # ==========================================
-from .config import get_config
-from .networks.vision_transformer import SwinUnet as ViT_seg
+from config import get_config
+from networks.vision_transformer import SwinUnet as ViT_seg
 
 
 # ==========================================

@@ -16,9 +16,9 @@ import matplotlib.pyplot as plt
 # 1. 核心导入：直接使用官方的模块
 # ==========================================
 # 导入官方 MK-UNet 模型
-from .mkunet_network import MK_UNet
+from mkunet_network import MK_UNet
 # 导入官方针对医学分割设计的加权结构损失函数
-from .train_polyp import structure_loss
+from train_polyp import structure_loss
 
 
 # ==========================================
