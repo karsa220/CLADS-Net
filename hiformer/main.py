@@ -14,8 +14,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 
-from .models.HiFormer import HiFormer
-from .configs.HiFormer_configs import get_hiformer_b_configs, get_hiformer_s_configs, get_hiformer_l_configs
+from models.HiFormer import HiFormer
+from configs.HiFormer_configs import get_hiformer_b_configs, get_hiformer_s_configs, get_hiformer_l_configs
 
 
 # ==========================================

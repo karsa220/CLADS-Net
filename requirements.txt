@@ -31,3 +31,4 @@ huggingface-hub>=0.11.0
 ml_collections
 tensorboardx
 medpy
+segmentation-models-pytorch
