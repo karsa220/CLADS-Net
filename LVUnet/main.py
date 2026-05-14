@@ -119,7 +119,7 @@ def main():
     DEEP_TRAINING = True  # 开启 LV-UNet 的深度训练特性
     save_path = "best_busi.pth"
 
-    data_dir = r"../data/Dataset_BUSI_with_GT"
+    data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()} | Deep Training: {DEEP_TRAINING}")
 

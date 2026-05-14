@@ -146,7 +146,7 @@ def main():
     MODE = "train"
     save_path = "best_busi.pth"  # 更新权重名字
 
-    data_dir = r"../data/Dataset_BUSI_with_GT"
+    data_dir = r"D:\PycharmProjects\data\Dataset_BUSI_with_GT"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device} | 🔄 Current Mode: {MODE.upper()}")
     model = SegFormerWrapper(pretrained_model="nvidia/mit-b0", num_classes=1).to(device)
