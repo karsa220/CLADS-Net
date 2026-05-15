@@ -1,3 +1,5 @@
+OS:
+windows 11
 Environment:
 torch==2.10.0+cu128
 torchvision==0.25.0+cu128
